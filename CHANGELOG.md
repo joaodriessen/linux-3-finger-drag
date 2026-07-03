@@ -1,5 +1,77 @@
 # Changelog
 
+## 2.0.0 - 2026-07-03
+
+Major rework of this fork: the gesture logic is now a pure, fully
+unit-tested state machine, and the runtime is event-driven.
+
+### Fixed
+
+- **4-finger liftoff hijack**: the staggered liftoff at the tail of every
+  4-finger gesture passes through exactly 3 active fingers; that moment
+  was classified as a drag, producing a phantom left-click at the end of
+  4-finger swipes. Touches that ever exceeded 3 fingers can no longer
+  become drags.
+- **Phantom slots after SYN_DROPPED**: the kernel resync read MAX_SLOTS
+  entries regardless of the device's real slot range; zeroed tail entries
+  (tracking_id 0) counted as active touches. Snapshots are now sized to
+  the device's actual ABS_MT_SLOT range.
+- Resyncs now also *release* clone slots whose fingers lifted during the
+  dropped window (previously the clone could hold a phantom touch
+  forever), re-baseline an in-flight drag instead of applying the gap as
+  a cursor jump, and end a drag/buffered touch that fully lifted inside
+  the drop.
+- SYN_DROPPED handling now follows the evdev protocol (discard everything
+  up to and including the next SYN_REPORT before resyncing).
+- Log files are created if missing (logFile previously required the file
+  to already exist).
+
+### Added
+
+- **Pure gesture state machine** (`src/runtime/gesture.rs`) with an
+  injected clock, plus a regression test suite encoding every failure
+  mode this project has hit live (staggered touchdowns/liftoffs, phantom
+  taps, 4-finger transients, drag-lock misbehavior, resync edge cases).
+- **Software-in-the-loop integration test**: creates a fake touchpad via
+  uinput, drives the real binary against it with `--device`, and asserts
+  on the actual clone/virtual-mouse output streams.
+- `--device /dev/input/eventN` CLI flag (skips auto-discovery).
+- Correct-by-construction **drag-lock** (`dragEndDelay` > 0): a new
+  3-finger touch inside the window resumes the same held drag; any other
+  touch releases the button *before* its events are relayed — the
+  regression that shipped with the first drag-lock attempt (1-finger
+  motion dragging things after a drag) is now structurally impossible,
+  and tested.
+- Sub-pixel motion carry: slow drags no longer lose the fractional
+  remainder of each frame's motion to integer truncation.
+- In-process touchpad re-discovery on ENODEV (device re-enumeration no
+  longer kills the service), with `Restart=on-failure` in the unit as
+  backstop.
+- A `phys` marker (`linux-3-finger-drag/proxy`) on the synthetic clone so
+  discovery can never grab our own clone (includes a manual UI_SET_PHYS
+  ioctl: input-linux 0.7's binding mis-encodes the ioctl size).
+
+### Changed
+
+- **Event-driven runtime**: the old 5 ms busy-poll loop (plus its config
+  mtime check 200x/s) is replaced by a single-threaded tokio loop that
+  sleeps on the device fd and on exact gesture-decision deadlines. Idle
+  CPU is zero; decisions land on time instead of on the next poll tick.
+- Touchpad discovery inspects evdev capabilities directly; the `input`
+  (libinput FFI) and unmaintained `users` crates are gone, as are
+  `signal-hook`, `futures-lite`, `async-io`, and the `criterion` dev-dep.
+  No C library dependencies remain.
+- The drag-end timer thread, control-signal channel, and
+  `VirtualTrackpad::clone` machinery are gone; the delay lives in the
+  state machine.
+- Release profile builds with LTO.
+
+### Removed
+
+- `responseTime` config knob (no poll interval exists anymore; leftover
+  entries in existing config files are ignored).
+- `response-map.md` (described the pre-proxy libinput design).
+
 ## 1.6.0 - 2025-11-24
 
 ### Fixed
