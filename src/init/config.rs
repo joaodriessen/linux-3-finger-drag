@@ -58,6 +58,32 @@ pub struct Configuration {
     #[serde(default = "default_5ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub response_time: Duration,        // in milliseconds
+
+    // How long a fresh touch that's still ambiguous (2 or 3 fingers,
+    // possibly still growing) is held back from the compositor before a
+    // final decision is made: commit to a 3-finger drag, or release it as
+    // an ordinary gesture. Without this, an asynchronous (non-simultaneous)
+    // 3-finger touchdown briefly looks like a real 2-finger touch to the
+    // compositor, which libinput can register as a 2-finger tap
+    // (right-click) the instant the 3rd finger arrives and that touch gets
+    // withdrawn -- and a 4-finger swipe that starts with only 3 fingers
+    // detected in the first instant can get mistaken for a drag before the
+    // 4th finger is seen. Same idea in reverse handles liftoff: see
+    // mt_proxy.rs.
+    #[serde(default = "default_50ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    pub entry_debounce: Duration,       // in milliseconds
+
+    // How long a touch that starts (and so far stays) at exactly 1 finger
+    // is held back before being relayed live. Deliberately much shorter
+    // than entry_debounce: ordinary single-finger pointer movement is by
+    // far the most common gesture, including the touch-lift-reposition
+    // cycle people use to cover long distances on a small trackpad, so it
+    // must never feel delayed. This only needs to be long enough to catch
+    // a 2nd finger landing a beat behind the 1st.
+    #[serde(default = "default_15ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    pub probe_delay: Duration,          // in milliseconds
 }
 
 impl Default for Configuration {
@@ -67,7 +93,9 @@ impl Default for Configuration {
             drag_end_delay: Duration::from_millis(0),
             log_file: "stdout".to_string(),
             log_level: LogLevel::INFO,
-            response_time: Duration::from_millis(5)
+            response_time: Duration::from_millis(5),
+            entry_debounce: Duration::from_millis(50),
+            probe_delay: Duration::from_millis(15)
         }
     }
 }
@@ -79,6 +107,8 @@ impl Default for Configuration {
 fn default_1()      -> f64      { 1.0 }
 fn default_0ms()    -> Duration { Duration::from_millis(0) }
 fn default_5ms()    -> Duration { Duration::from_millis(5) }
+fn default_15ms()   -> Duration { Duration::from_millis(15) }
+fn default_50ms()   -> Duration { Duration::from_millis(50) }
 fn default_stdout() -> String   { "stdout".to_string() }
 fn default_info()   -> LogLevel { LogLevel::INFO }
 
@@ -114,7 +144,9 @@ pub fn get_config_file_path() -> Result<PathBuf, std::io::Error> {
 //     dragEndDelay: 0,
 //     logFile: "stdout",
 //     logLevel: "info",
-//     responseTime: 5
+//     responseTime: 5,
+//     entryDebounce: 50,
+//     probeDelay: 15
 // }
 //
 // The user is also warned about this, so they can address the issues

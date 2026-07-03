@@ -16,11 +16,12 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::Instant;
 
 use nix::libc::O_NONBLOCK;
 use tracing::{debug, info, trace, warn};
 
-use input_linux::{sys, AbsoluteAxis, AbsoluteInfoSetup, EvdevHandle, EventKind, InputId, UInputHandle};
+use input_linux::{sys, AbsoluteAxis, AbsoluteInfoSetup, EvdevHandle, EventKind, UInputHandle};
 
 use super::event_handler::{GestureTranslator, GtError};
 
@@ -87,6 +88,16 @@ pub struct MtProxy {
     drag_last_pos: Option<(i32, i32)>,
     frame: Vec<sys::input_event>,
     read_buf: [sys::input_event; READ_BATCH],
+    // Bookkeeping for one continuous touch (from the first finger down to
+    // all fingers up), tracked regardless of how many fingers are on the
+    // pad. Frames are buffered -- withheld from the compositor entirely --
+    // until this touch is either "settled" (decided to be an ordinary
+    // gesture, safe to relay live from here on) or turns into a drag. See
+    // handle_frame for the decision logic.
+    pending_frames: Vec<sys::input_event>,
+    touch_start: Option<Instant>,
+    touch_max: usize,
+    settled: bool,
 }
 
 impl MtProxy {
@@ -127,6 +138,10 @@ impl MtProxy {
             drag_last_pos: None,
             frame: Vec::with_capacity(READ_BATCH),
             read_buf: [zero_event(); READ_BATCH],
+            pending_frames: Vec::new(),
+            touch_start: None,
+            touch_max: 0,
+            settled: false,
         })
     }
 
@@ -159,15 +174,22 @@ impl MtProxy {
             synth.set_propbit(prop)?;
         }
 
-        let input_id = InputId {
-            bustype: input_linux::sys::BUS_USB,
-            vendor: 0x1234,
-            product: 0x5679, // distinct from the drag-emulation mouse's 0x5678
-            version: 0,
-        };
-        let device_name = b"Virtual touchpad (proxied by linux-3-finger-drag)";
-        synth.create(&input_id, device_name, 0, &abs_setups)?;
-        debug!("Synthetic touchpad clone created.");
+        // Impersonate the real device's identity (vendor/product/name), not
+        // just its capabilities. KDE keys its per-device libinput settings
+        // (natural scroll, pointer accel profile, tap-to-click, click
+        // method...) in kcminputrc by exactly this triple -- a synthetic
+        // device with a made-up identity is "new" to KDE and silently falls
+        // back to defaults, which is what caused scrolling to come back
+        // reversed after this proxy replaced the real device as KWin's
+        // input source. Matching identity means the user's existing saved
+        // preferences apply automatically, with nothing to keep in sync.
+        let real_id = real.device_id()?;
+        let mut real_name = real.device_name()?;
+        while real_name.last() == Some(&0) {
+            real_name.pop();
+        }
+        synth.create(&real_id, &real_name, 0, &abs_setups)?;
+        debug!("Synthetic touchpad clone created, impersonating \"{}\".", String::from_utf8_lossy(&real_name));
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -179,6 +201,11 @@ impl MtProxy {
     /// since the last SYN_REPORT). Safe to call frequently in a poll loop.
     pub async fn poll(&mut self, translator: &mut GestureTranslator) -> Result<(), GtError> {
         loop {
+            // Independent of whether new events arrived this tick: a touch
+            // that's holding perfectly still (no new events at all) still
+            // needs its probe/confirm decision made on wall-clock time.
+            self.resolve_touch_timeout(translator).await?;
+
             let n = match self.real.read(&mut self.read_buf) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -223,8 +250,7 @@ impl MtProxy {
 
     /// Re-derives slot state directly from the kernel (EVIOCGMTSLOTS)
     /// instead of trusting the incremental event history, used after a
-    /// SYN_DROPPED. Forces a full resync dump to the synthetic device
-    /// afterward, same as any other suppress/passthrough transition.
+    /// SYN_DROPPED.
     fn resync(&mut self) -> Result<(), GtError> {
         let mut ids = vec![0i32; MAX_SLOTS];
         self.real.multi_touch_slots(AbsoluteAxis::MultitouchTrackingId, &mut ids)?;
@@ -239,9 +265,59 @@ impl MtProxy {
             self.slots[slot] = Slot { tracking_id: ids[slot], x: xs[slot], y: ys[slot] };
         }
 
+        // Whatever events the kernel dropped may have left the synthetic
+        // device (or a frame we're still buffering, waiting to decide what
+        // to do with it) holding stale positions for slots that are still
+        // active. Left uncorrected, a later real event touching that slot
+        // again looks like a sudden, discontinuous jump once it finally
+        // arrives -- exactly the kind of anomaly a pinch/zoom gesture
+        // recognizer can misfire on. So assert the now-authoritative
+        // position explicitly rather than waiting for it to resolve
+        // itself.
+        let correction = self.active_slot_dump();
+        if correction.is_empty() {
+            return Ok(());
+        }
+
+        if self.suppressing {
+            // drive_drag reads self.slots directly next frame, and nothing
+            // was relayed during suppression, so there's nothing
+            // downstream to correct.
+        } else if self.touch_start.is_some() && !self.settled {
+            // Still deciding this touch's fate -- fold the correction into
+            // the buffer so it's included whenever this touch is flushed.
+            self.pending_frames.extend(correction);
+            self.pending_frames.push(syn_report());
+        } else {
+            // Live passthrough: the gap is visible right now, so correct
+            // it immediately instead of waiting for the next real frame.
+            let mut frame = correction;
+            frame.push(syn_report());
+            self.synth.write(&frame)?;
+            for slot in 0..MAX_SLOTS {
+                self.relayed_active[slot] = self.slots[slot].tracking_id >= 0;
+            }
+        }
+
         // don't decide suppress/passthrough here; the next real frame will
         // trigger handle_frame() and pick correctly based on active_count
         Ok(())
+    }
+
+    /// Builds SLOT/TRACKING_ID/POSITION_X/POSITION_Y events asserting the
+    /// current, authoritative state of every active slot.
+    fn active_slot_dump(&self) -> Vec<sys::input_event> {
+        let mut dump = Vec::new();
+        for slot in 0..MAX_SLOTS {
+            let s = self.slots[slot];
+            if s.tracking_id >= 0 {
+                dump.push(abs_event(ABS_MT_SLOT, slot as i32));
+                dump.push(abs_event(ABS_MT_TRACKING_ID, s.tracking_id));
+                dump.push(abs_event(ABS_MT_POSITION_X, s.x));
+                dump.push(abs_event(ABS_MT_POSITION_Y, s.y));
+            }
+        }
+        dump
     }
 
     fn active_slots(&self) -> Vec<usize> {
@@ -250,29 +326,167 @@ impl MtProxy {
 
     async fn handle_frame(&mut self, translator: &mut GestureTranslator) -> Result<(), GtError> {
         let active = self.active_slots();
+        let count = active.len();
 
-        if active.len() == 3 {
-            if !self.suppressing {
-                self.enter_suppress()?;
-                translator.mouse_down().await?;
+        // Once a drag has started, stay suppressed until every finger is
+        // off, not just until the count first drops below 3. Fingers never
+        // lift in perfect unison; without this hysteresis the trailing 1-2
+        // fingers of a liftoff get relayed as a fresh, real touch the
+        // instant the first finger leaves -- which libinput reads as a
+        // brief 2-finger tap (right-click) the moment the rest lift too.
+        if self.suppressing {
+            if count == 0 {
+                self.suppressing = false;
+                self.drag_ref_slot = None;
+                self.drag_last_pos = None;
+                // Reset touch bookkeeping too: without this, the next
+                // touch inherits touch_max == 3 / settled == true from
+                // this drag, so a later stray 3-finger moment would skip
+                // the debounce protection entirely.
+                self.touch_start = None;
+                self.touch_max = 0;
+                self.settled = false;
+                translator.handle_mouse_up().await?;
+                // synth already has nothing active on it (suppression never
+                // relayed anything), so there's nothing to resync here
+                return Ok(());
             }
             self.drive_drag(&active, translator).await?;
             // frame intentionally not relayed
             return Ok(());
         }
 
-        if self.suppressing {
-            self.suppressing = false;
-            self.drag_ref_slot = None;
-            self.drag_last_pos = None;
-            translator.handle_mouse_up().await?;
-            self.resync_synth_to_real()?;
-            // the resync dump above already reflects this frame's true
-            // state, so the raw frame itself doesn't also need relaying
-            return Ok(());
+        if count == 0 {
+            let had_pending = self.touch_start.is_some() && !self.settled;
+            self.touch_start = None;
+            self.touch_max = 0;
+            self.settled = false;
+            if had_pending {
+                // Touch ended before a decision was ever reached (e.g. a
+                // quick tap) -- flush whatever was buffered, including this
+                // release frame, so it isn't silently swallowed.
+                self.pending_frames.extend_from_slice(&self.frame);
+                return self.flush_pending();
+            }
+            // Not pending: either this touch was already settled and
+            // relayed live (most touches), in which case this frame
+            // carries real release events the compositor needs to see, or
+            // there's nothing active and nothing to do either way.
+            return self.relay_frame();
         }
 
-        self.relay_frame()
+        if self.touch_start.is_none() {
+            // The first frame of a brand new touch.
+            self.touch_start = Some(Instant::now());
+            self.touch_max = count;
+            self.settled = false;
+            self.pending_frames.clear();
+        } else {
+            self.touch_max = self.touch_max.max(count);
+        }
+
+        if self.settled {
+            // Already decided this touch is an ordinary gesture (or grew
+            // past 3 into one) -- relay live from here on. The one
+            // exception is newly reaching exactly 3 without ever having
+            // lifted, well after the decision window closed: rare, but
+            // still must not leak through as a real 3-finger touch on the
+            // compositor. No debounce needed here -- growing an
+            // already-settled touch all the way to a deliberate drag
+            // without ever lifting first is rare enough not to warrant one.
+            if count == 3 {
+                self.enter_suppress()?;
+                translator.mouse_down().await?;
+                self.drive_drag(&active, translator).await?;
+                return Ok(());
+            }
+            return self.relay_frame();
+        }
+
+        self.pending_frames.extend_from_slice(&self.frame);
+
+        if self.touch_max >= 4 {
+            // Unambiguously bigger than a 3-finger drag could ever be --
+            // no need to wait out the rest of the window.
+            self.settled = true;
+            return self.flush_pending();
+        }
+
+        let elapsed = self.touch_start.unwrap().elapsed();
+
+        if count == 1 && self.touch_max == 1 && elapsed >= translator.cfg.probe_delay {
+            // Still just one finger after a short probe: ordinary pointer
+            // movement, by far the most common case. Go live now rather
+            // than waiting out the full entry_debounce, or every
+            // touch-lift-reposition cycle of normal cursor use would add
+            // a felt hitch.
+            self.settled = true;
+            return self.flush_pending();
+        }
+
+        if elapsed >= translator.cfg.entry_debounce {
+            return self.resolve_touch_decision(translator, &active, count).await;
+        }
+
+        Ok(())
+    }
+
+    /// Called every poll tick (whether or not a new frame arrived) so a
+    /// touch that's holding still (no new events at all) still gets its
+    /// probe/confirm decision made on wall-clock time, not just on the
+    /// next event.
+    async fn resolve_touch_timeout(&mut self, translator: &mut GestureTranslator) -> Result<(), GtError> {
+        if self.suppressing || self.settled {
+            return Ok(());
+        }
+        let Some(since) = self.touch_start else { return Ok(()) };
+
+        let active = self.active_slots();
+        let count = active.len();
+
+        if count == 1 && self.touch_max == 1 && since.elapsed() >= translator.cfg.probe_delay {
+            self.settled = true;
+            return self.flush_pending();
+        }
+
+        if since.elapsed() >= translator.cfg.entry_debounce {
+            return self.resolve_touch_decision(translator, &active, count).await;
+        }
+
+        Ok(())
+    }
+
+    /// The entry_debounce window has closed: commit to a drag if the touch
+    /// held stably at exactly 3 fingers the whole time, otherwise release
+    /// it to the compositor as an ordinary gesture.
+    async fn resolve_touch_decision(&mut self, translator: &mut GestureTranslator, active: &[usize], count: usize) -> Result<(), GtError> {
+        if count == 3 && self.touch_max == 3 {
+            self.pending_frames.clear();
+            self.settled = true;
+            self.enter_suppress()?;
+            translator.mouse_down().await?;
+            self.drive_drag(active, translator).await?;
+            return Ok(());
+        }
+        self.settled = true;
+        self.flush_pending()
+    }
+
+    /// Releases a buffered touch to the compositor: it either never
+    /// reached 3 fingers, or grew past 3 into a bigger gesture that isn't
+    /// ours to intercept. Replays the exact frames as they happened, then
+    /// marks whatever is active now as relayed so later frames diff
+    /// correctly.
+    fn flush_pending(&mut self) -> Result<(), GtError> {
+        if !self.pending_frames.is_empty() {
+            self.synth.write(&self.pending_frames)?;
+            trace!("Flushed a buffered touch ({} events) to the synthetic device.", self.pending_frames.len());
+        }
+        for slot in 0..MAX_SLOTS {
+            self.relayed_active[slot] = self.slots[slot].tracking_id >= 0;
+        }
+        self.pending_frames.clear();
+        Ok(())
     }
 
     fn enter_suppress(&mut self) -> Result<(), GtError> {
@@ -318,39 +532,12 @@ impl MtProxy {
         Ok(())
     }
 
-    /// Dumps the current real slot state to the synthetic device as a
-    /// coherent, self-contained frame -- used when leaving suppression, so
-    /// the compositor gets an accurate picture regardless of which fields
-    /// happened to change in the triggering frame.
-    fn resync_synth_to_real(&mut self) -> Result<(), GtError> {
-        let mut dump = Vec::new();
-        for slot in 0..MAX_SLOTS {
-            let s = self.slots[slot];
-            let active = s.tracking_id >= 0;
-            if active || self.relayed_active[slot] {
-                dump.push(abs_event(ABS_MT_SLOT, slot as i32));
-                dump.push(abs_event(ABS_MT_TRACKING_ID, s.tracking_id));
-                if active {
-                    dump.push(abs_event(ABS_MT_POSITION_X, s.x));
-                    dump.push(abs_event(ABS_MT_POSITION_Y, s.y));
-                }
-                self.relayed_active[slot] = active;
-            }
-        }
-        if !dump.is_empty() {
-            dump.push(syn_report());
-            self.synth.write(&dump)?;
-            trace!("Resynced synthetic device to current real slot state.");
-        }
-        Ok(())
-    }
-
     fn relay_frame(&mut self) -> Result<(), GtError> {
         if self.frame.is_empty() {
             return Ok(());
         }
-        for slot in self.active_slots() {
-            self.relayed_active[slot] = true;
+        for slot in 0..MAX_SLOTS {
+            self.relayed_active[slot] = self.slots[slot].tracking_id >= 0;
         }
         self.synth.write(&self.frame)?;
         Ok(())
