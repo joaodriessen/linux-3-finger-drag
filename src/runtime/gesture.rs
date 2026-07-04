@@ -33,7 +33,10 @@
 
 use std::time::{Duration, Instant};
 
+use tracing::{debug, warn};
+
 pub const EV_SYN: u16 = 0x00;
+pub const EV_KEY: u16 = 0x01;
 pub const EV_ABS: u16 = 0x03;
 pub const SYN_REPORT: u16 = 0x00;
 pub const SYN_DROPPED: u16 = 0x03;
@@ -102,6 +105,14 @@ pub struct Timing {
     /// motion after a drag can never smear the held button around
     /// (the exact regression the first drag-lock attempt shipped).
     pub drag_end_delay: Duration,
+    /// How long after a drag commits the button press is deferred when
+    /// the fingers haven't moved yet. The press fires at the first
+    /// actual drag motion or when this grace expires -- whichever comes
+    /// first -- so a 4th finger landing *after* the entry window (a
+    /// fast/sloppy 4-finger swipe, whose fingers stagger more the
+    /// faster the hand comes down) can abort the misclassified drag
+    /// without a phantom click ever having been sent.
+    pub press_grace: Duration,
     /// Combined px-per-mm * user acceleration factor.
     pub px_per_mm: f64,
 }
@@ -144,6 +155,20 @@ pub struct GestureMachine {
     drag_last_pos: Option<(i32, i32)>,
     /// Sub-pixel motion carried between frames.
     carry: (f64, f64),
+    /// While a committed drag hasn't moved yet: when to press the button
+    /// anyway (see [`Timing::press_grace`]). Cleared once pressed.
+    press_deadline: Option<Instant>,
+
+    /// Last EV_KEY values seen from the REAL device (BTN_TOUCH,
+    /// BTN_TOOL_*...). The truth about tool state on the pad.
+    real_keys: Vec<(u16, i32)>,
+    /// Last EV_KEY values the CLONE has been told. Needed to emit
+    /// consistent closing state (BTN_TOUCH=0 etc.) when suppression
+    /// yanks a partially-relayed touch away -- leaving these stuck at 1
+    /// desyncs libinput's finger accounting (and with tap-to-click on,
+    /// a slot release without tool release reads as a 2-finger tap:
+    /// phantom right-click).
+    clone_keys: Vec<(u16, i32)>,
 
     /// Frames withheld from the compositor while a fresh touch is still
     /// being classified.
@@ -173,6 +198,9 @@ impl GestureMachine {
             drag_ref_slot: None,
             drag_last_pos: None,
             carry: (0.0, 0.0),
+            press_deadline: None,
+            real_keys: Vec::new(),
+            clone_keys: Vec::new(),
             pending: Vec::new(),
             touch_start: None,
             touch_max: 0,
@@ -199,7 +227,9 @@ impl GestureMachine {
     /// land on time instead of on the next poll interval.
     pub fn next_deadline(&self) -> Option<Instant> {
         if self.suppressing {
-            return None;
+            // a committed drag that hasn't moved yet still owes a
+            // deferred button press
+            return if self.held { None } else { self.press_deadline };
         }
         if let Some(start) = self.touch_start {
             if !self.settled {
@@ -216,10 +246,20 @@ impl GestureMachine {
     }
 
     /// Wall-clock-only work: classification windows closing on a touch
-    /// that's holding perfectly still, and the drag-lock timeout.
+    /// that's holding perfectly still, the deferred drag press, and the
+    /// drag-lock timeout.
     pub fn on_tick(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         if self.suppressing {
+            // Stationary drag: no motion has pressed the button yet, and
+            // no 4th finger has shown up to abort -- commit the press.
+            if !self.held {
+                if let Some(deadline) = self.press_deadline {
+                    if now >= deadline {
+                        self.press_button(&mut out);
+                    }
+                }
+            }
             return out;
         }
 
@@ -246,7 +286,7 @@ impl GestureMachine {
             return out;
         }
         if now >= start + self.timing.entry_debounce {
-            self.resolve_touch_decision(count, &mut out);
+            self.resolve_touch_decision(count, now, &mut out);
         }
         out
     }
@@ -256,8 +296,12 @@ impl GestureMachine {
     /// be fed; discard them and call [`on_resync`](Self::on_resync)
     /// with a fresh kernel snapshot instead.
     pub fn on_frame(&mut self, frame: &[Ev], now: Instant) -> Vec<Output> {
-        // 1. fold the frame's slot updates into our model
+        // 1. fold the frame's slot and key-state updates into our model
         for ev in frame {
+            if ev.type_ == EV_KEY {
+                Self::note_key(&mut self.real_keys, ev.code, ev.value);
+                continue;
+            }
             if ev.type_ != EV_ABS {
                 continue;
             }
@@ -371,12 +415,17 @@ impl GestureMachine {
                 self.suppressing = false;
                 self.drag_ref_slot = None;
                 self.drag_last_pos = None;
+                self.press_deadline = None;
                 // Reset touch bookkeeping: without this the next touch
                 // would inherit touch_max/settled from this drag and
                 // skip the debounce protection entirely.
                 self.touch_start = None;
                 self.touch_max = 0;
                 self.settled = false;
+                // A committed drag that never moved and lifted before
+                // the press grace still owes its click: press now so the
+                // release below (or the drag-lock) completes it.
+                self.press_button(out);
                 if self.timing.drag_end_delay > Duration::ZERO {
                     // Drag-lock: keep the button held; a new 3-finger
                     // touch inside the window resumes the drag, anything
@@ -387,6 +436,45 @@ impl GestureMachine {
                 }
                 // The synth clone has nothing active on it (suppression
                 // never relayed anything), so there's nothing to resync.
+                return;
+            }
+            if count >= 4 {
+                // A 4th finger arrived AFTER the entry window closed --
+                // this was never a drag, it's a fast/sloppy 4-finger
+                // gesture whose last finger staggered in late (the
+                // faster the hand comes down, the bigger the stagger).
+                // Abort: release the touch to the compositor mid-gesture
+                // so the rest of the swipe still registers. Thanks to
+                // the deferred press, in the common case no button was
+                // ever pressed, so nothing to undo.
+                if self.held {
+                    warn!(
+                        "4th finger after the drag already pressed the button; \
+                        releasing (a brief phantom click was unavoidable)"
+                    );
+                } else {
+                    debug!("late 4th finger: aborting committed drag, handing touch to compositor");
+                }
+                self.suppressing = false;
+                self.drag_ref_slot = None;
+                self.drag_last_pos = None;
+                self.press_deadline = None;
+                self.settled = true; // continues as an ordinary live touch
+                self.release_button(out);
+                // Introduce the touch to the clone as a fresh, complete,
+                // consistent touchdown: all live slots plus the real
+                // pad's current tool state (BTN_TOUCH/BTN_TOOL_*).
+                let mut intro = self.active_slot_dump();
+                for i in 0..self.real_keys.len() {
+                    let (code, value) = self.real_keys[i];
+                    if Self::key_value(&self.clone_keys, code) != value {
+                        intro.push(Ev::new(EV_KEY, code, value));
+                        Self::note_key(&mut self.clone_keys, code, value);
+                    }
+                }
+                intro.push(Ev::syn());
+                self.mark_relayed();
+                out.push(Output::EmitSynth(intro));
                 return;
             }
             self.drive_drag(&active, out);
@@ -435,9 +523,7 @@ impl GestureMachine {
             // fingers never lift in unison -- from being hijacked into
             // a phantom drag + click.
             if count == 3 && self.touch_max == 3 {
-                self.enter_suppress(out);
-                self.press_button(out);
-                self.drive_drag(&active, out);
+                self.commit_drag(&active, now, out);
                 return;
             }
             self.relay_frame(frame, out);
@@ -468,25 +554,36 @@ impl GestureMachine {
         }
 
         if now >= start + self.timing.entry_debounce {
-            self.resolve_touch_decision(count, out);
+            self.resolve_touch_decision(count, now, out);
         }
     }
 
     /// The entry_debounce window has closed: commit to a drag if the
     /// touch held stably at exactly 3 fingers the whole time, otherwise
     /// release it to the compositor as an ordinary gesture.
-    fn resolve_touch_decision(&mut self, count: usize, out: &mut Vec<Output>) {
+    fn resolve_touch_decision(&mut self, count: usize, now: Instant, out: &mut Vec<Output>) {
         if count == 3 && self.touch_max == 3 {
             self.pending.clear();
-            self.settled = true;
-            self.enter_suppress(out);
-            self.press_button(out);
             let active = self.active_slots();
-            self.drive_drag(&active, out);
+            self.commit_drag(&active, now, out);
             return;
         }
         self.settled = true;
         self.flush_pending(out);
+    }
+
+    /// Commit the current touch as a 3-finger drag. The button press is
+    /// DEFERRED: it fires at the first actual drag motion, or when
+    /// press_grace expires -- so a late 4th finger (fast 4-finger swipe)
+    /// can still abort without a phantom click having been sent.
+    fn commit_drag(&mut self, active: &[usize], now: Instant, out: &mut Vec<Output>) {
+        debug!("3-finger touch committed as a drag");
+        self.settled = true;
+        self.enter_suppress(out);
+        if !self.held {
+            self.press_deadline = Some(now + self.timing.press_grace);
+        }
+        self.drive_drag(active, out);
     }
 
     /// Releases a buffered touch to the compositor: it either never
@@ -498,7 +595,9 @@ impl GestureMachine {
             self.release_button(out);
         }
         if !self.pending.is_empty() {
-            out.push(Output::EmitSynth(std::mem::take(&mut self.pending)));
+            let flushed = std::mem::take(&mut self.pending);
+            self.note_clone_keys(&flushed);
+            out.push(Output::EmitSynth(flushed));
         }
         self.mark_relayed();
     }
@@ -506,6 +605,7 @@ impl GestureMachine {
     fn relay_frame(&mut self, frame: &[Ev], out: &mut Vec<Output>) {
         self.mark_relayed();
         if !frame.is_empty() {
+            self.note_clone_keys(frame);
             out.push(Output::EmitSynth(frame.to_vec()));
         }
     }
@@ -516,9 +616,35 @@ impl GestureMachine {
         }
     }
 
+    /// Record what EV_KEY state a batch of events tells the clone.
+    fn note_clone_keys(&mut self, events: &[Ev]) {
+        for ev in events {
+            if ev.type_ == EV_KEY {
+                Self::note_key(&mut self.clone_keys, ev.code, ev.value);
+            }
+        }
+    }
+
+    fn note_key(map: &mut Vec<(u16, i32)>, code: u16, value: i32) {
+        for entry in map.iter_mut() {
+            if entry.0 == code {
+                entry.1 = value;
+                return;
+            }
+        }
+        map.push((code, value));
+    }
+
+    fn key_value(map: &[(u16, i32)], code: u16) -> i32 {
+        map.iter().find(|e| e.0 == code).map(|e| e.1).unwrap_or(0)
+    }
+
     /// Begin withholding everything from the compositor. Any slots the
     /// synthetic clone still believes are active are explicitly released
-    /// first, so it is never left holding a half-open touch.
+    /// first -- and any tool state (BTN_TOUCH, BTN_TOOL_*) it was told is
+    /// pressed is explicitly released too, so it is never left holding a
+    /// half-open touch or stuck finger-count bits (which desync
+    /// libinput's tap/gesture accounting).
     fn enter_suppress(&mut self, out: &mut Vec<Output>) {
         self.suppressing = true;
         self.lock_deadline = None; // a live drag owns the button now
@@ -532,6 +658,13 @@ impl GestureMachine {
                 self.relayed_active[slot] = false;
             }
         }
+        for i in 0..self.clone_keys.len() {
+            let (code, value) = self.clone_keys[i];
+            if value != 0 {
+                release.push(Ev::new(EV_KEY, code, 0));
+                self.clone_keys[i].1 = 0;
+            }
+        }
         if !release.is_empty() {
             release.push(Ev::syn());
             out.push(Output::EmitSynth(release));
@@ -541,6 +674,7 @@ impl GestureMachine {
     fn press_button(&mut self, out: &mut Vec<Output>) {
         if !self.held {
             self.held = true;
+            self.press_deadline = None;
             out.push(Output::MouseDown);
         }
         // if still held from a drag-lock, the drag just resumes --
@@ -578,6 +712,9 @@ impl GestureMachine {
             // slow, precise drags don't systematically lose motion
             self.carry = (px - dx as f64, py - dy as f64);
             if dx != 0 || dy != 0 {
+                // real drag motion: the deferred press (if still pending)
+                // must land before the movement it accompanies
+                self.press_button(out);
                 out.push(Output::MouseMove { dx, dy });
             }
         } else {

@@ -4,5 +4,6 @@
     "logFile": "stdout",
     "logLevel": "info",
     "entryDebounce": 50,
-    "probeDelay": 15
+    "probeDelay": 15,
+    "pressGrace": 75
 }

@@ -129,6 +129,7 @@ than one touchpad (auto-discovery proxies the first one found).
 | `dragEndDelay` | `0` | drag-lock, in ms: after lifting, the button stays held this long, and a new 3-finger touch inside the window **continues the same drag**. Any other touch releases the button *before* it is relayed, so post-drag pointer motion can never smear the held button around. `0` disables. |
 | `entryDebounce` | `50` | ms an ambiguous (2-3 finger, possibly still growing) fresh touch is withheld before committing: drag, or replay to the compositor |
 | `probeDelay` | `15` | ms a so-far-lone finger is withheld (just long enough to catch a 2nd/3rd finger landing a beat behind the 1st) |
+| `pressGrace` | `75` | ms a committed drag defers its button press while the fingers haven't moved. Lets a 4th finger that lands *after* the entry window (fast, sloppy 4-finger swipes stagger hard) abort the misclassified drag with no phantom click — the touch is handed to the compositor mid-gesture instead |
 | `logFile` | `"stdout"` | log destination (`"stdout"` or a file path) |
 | `logLevel` | `"info"` | `off` / `error` / `warn` / `info` / `debug` / `trace` |
 

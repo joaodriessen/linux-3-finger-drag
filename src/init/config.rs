@@ -93,6 +93,16 @@ pub struct Configuration {
     #[serde(default = "default_15ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub probe_delay: Duration, // in milliseconds
+
+    // How long a committed 3-finger drag defers its button press while
+    // the fingers haven't moved. The press fires at the first real drag
+    // motion or when this expires, whichever comes first. The window
+    // exists so a 4th finger landing late (a fast 4-finger swipe -- the
+    // faster the hand, the bigger the finger stagger) can abort a
+    // misclassified drag without a phantom click ever being sent.
+    #[serde(default = "default_75ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    pub press_grace: Duration, // in milliseconds
 }
 
 impl Configuration {
@@ -103,6 +113,7 @@ impl Configuration {
             probe_delay: self.probe_delay,
             entry_debounce: self.entry_debounce,
             drag_end_delay: self.drag_end_delay,
+            press_grace: self.press_grace,
             px_per_mm: PX_PER_MM * self.acceleration,
         }
     }
@@ -117,6 +128,7 @@ impl Default for Configuration {
             log_level: LogLevel::INFO,
             entry_debounce: Duration::from_millis(50),
             probe_delay: Duration::from_millis(15),
+            press_grace: Duration::from_millis(75),
         }
     }
 }
@@ -133,6 +145,9 @@ fn default_0ms() -> Duration {
 }
 fn default_15ms() -> Duration {
     Duration::from_millis(15)
+}
+fn default_75ms() -> Duration {
+    Duration::from_millis(75)
 }
 fn default_50ms() -> Duration {
     Duration::from_millis(50)

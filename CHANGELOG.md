@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.1.0 - 2026-07-04
+
+Fixes flaky 4-finger vertical swipes (overview/grid gestures sometimes
+not registering, especially on fast swipes).
+
+### Fixed
+
+- **Late-4th-finger bailout**: on a fast/sloppy 4-finger swipe the 4th
+  finger often lands *after* the 50ms entry window, so the machine saw a
+  stable 3-finger touch and committed a drag -- eating the swipe. A 4th
+  finger arriving during a committed drag now aborts it and hands the
+  touch to the compositor mid-gesture (full slot + tool-state
+  introduction), so the remaining swipe motion still registers.
+- **Deferred button press** (`pressGrace`, default 75ms): the drag's
+  button press now fires at the first real drag motion or when the grace
+  expires, whichever is first -- so the bailout above normally happens
+  before any press, and no phantom click is ever sent. Stationary-hold
+  presses and the "3-finger hold = click" behavior are preserved (a
+  liftoff inside the grace presses+releases at liftoff).
+- **Tool-state consistency on suppress**: entering suppression from a
+  partially-relayed touch (e.g. 2 fingers settled, 3rd added to start a
+  drag) released the clone's MT slots but left BTN_TOUCH/BTN_TOOL_*
+  stuck pressed -- desyncing libinput's finger accounting, and (with
+  tap-to-click on) making the yanked touch read as a 2-finger tap =
+  phantom right-click. The clone's relayed key state is now tracked and
+  explicitly released alongside the slots.
+
 ## 2.0.0 - 2026-07-03
 
 Major rework of this fork: the gesture logic is now a pure, fully

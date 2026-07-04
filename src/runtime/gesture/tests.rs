@@ -12,6 +12,7 @@ fn timing(drag_end_delay_ms: u64) -> Timing {
         probe_delay: Duration::from_millis(15),
         entry_debounce: Duration::from_millis(50),
         drag_end_delay: Duration::from_millis(drag_end_delay_ms),
+        press_grace: Duration::from_millis(75),
         px_per_mm: PX_PER_MM,
     }
 }
@@ -111,13 +112,22 @@ fn collect(mut acc: Vec<Output>, more: Vec<Output>) -> Vec<Output> {
     acc
 }
 
-/// Drive a full staggered 3-finger touchdown into a committed drag.
+/// Drive a full staggered 3-finger touchdown into a committed drag,
+/// then let the press grace expire so the button is actually pressed.
 /// Returns everything emitted along the way.
 fn start_drag(sim: &mut Sim) -> Vec<Output> {
+    let mut outs = commit_drag_only(sim);
+    outs = collect(outs, sim.tick(80)); // press grace expires -> MouseDown
+    outs
+}
+
+/// Like start_drag, but stops right after the drag commits -- inside the
+/// press-grace window, before any button press.
+fn commit_drag_only(sim: &mut Sim) -> Vec<Output> {
     let mut outs = sim.frame(&down(0, 100, 500, 500));
     outs = collect(outs, sim.frame_at(5, &down(1, 101, 600, 500)));
     outs = collect(outs, sim.frame_at(5, &down(2, 102, 700, 500)));
-    outs = collect(outs, sim.tick(45)); // debounce window closes
+    outs = collect(outs, sim.tick(45)); // debounce window closes: committed
     outs
 }
 
@@ -282,24 +292,170 @@ fn two_finger_scroll_relays_after_debounce() {
 
 /// Growing an already-settled touch to exactly 3 (1 -> settle -> +2)
 /// still becomes a drag, and the already-relayed slots are explicitly
-/// released on the clone first (never left half-open).
+/// released on the clone first (never left half-open). The relayed tool
+/// state (BTN_TOUCH etc.) must be released too: with tap-to-click on, a
+/// slot release without its tool release reads as a tap (phantom
+/// click), and stuck BTN_TOOL_* bits desync libinput's finger counting.
 #[test]
 fn growth_to_three_after_settle_becomes_drag_with_clean_release() {
+    const BTN_TOUCH: u16 = 0x14a;
     let mut sim = Sim::new();
-    sim.frame(&down(0, 1, 100, 100));
-    sim.tick(15); // settles as 1-finger, flushed live
+    let f = cat(&[&down(0, 1, 100, 100), &[Ev::new(EV_KEY, BTN_TOUCH, 1)][..]]);
+    sim.frame(&f);
+    sim.tick(15); // settles as 1-finger, flushed live (incl. BTN_TOUCH=1)
 
-    let outs = sim.frame_at(10, &cat(&[&down(1, 2, 200, 100), &down(2, 3, 300, 100)]));
-    assert_eq!(
-        mouse_downs(&outs),
-        1,
-        "late growth to 3 is a deliberate drag"
-    );
+    let mut outs = sim.frame_at(10, &cat(&[&down(1, 2, 200, 100), &down(2, 3, 300, 100)]));
     let evs = synth_events(&outs);
     assert!(
         evs.contains(&Ev::abs(ABS_MT_TRACKING_ID, -1)),
         "the relayed slot must be released on the clone before suppressing"
     );
+    assert!(
+        evs.contains(&Ev::new(EV_KEY, BTN_TOUCH, 0)),
+        "relayed tool state must be released along with the slots: {evs:?}"
+    );
+
+    // the press is deferred, but motion commits it
+    outs = sim.frame_at(10, &mv(0, 150, 100));
+    assert_eq!(
+        mouse_downs(&outs),
+        1,
+        "late growth to 3 is a deliberate drag"
+    );
+}
+
+// =========================================================================
+// deferred press & the late-4th-finger bailout
+// =========================================================================
+
+/// A fast 4-finger swipe staggers its fingers hard: the 4th can land
+/// AFTER the entry window closed on a stable-looking 3-finger touch.
+/// The committed drag must abort -- with no click, since nothing had
+/// pressed the button yet -- and the touch must be handed to the
+/// compositor mid-gesture so the rest of the swipe still registers.
+#[test]
+fn late_4th_finger_aborts_drag_without_click() {
+    const BTN_TOUCH: u16 = 0x14a;
+    let mut sim = Sim::new();
+    let mut outs = sim.frame(&cat(&[
+        &down(0, 1, 100, 100),
+        &[Ev::new(EV_KEY, BTN_TOUCH, 1)][..],
+    ]));
+    outs = collect(outs, sim.frame_at(5, &down(1, 2, 200, 100)));
+    outs = collect(outs, sim.frame_at(5, &down(2, 3, 300, 100)));
+    outs = collect(outs, sim.tick(45)); // committed as drag at ~55ms
+    assert_eq!(mouse_downs(&outs), 0, "press must be deferred at commit");
+
+    // the 4th finger lands 15ms after commit
+    let outs = sim.frame_at(15, &down(3, 4, 400, 100));
+    assert_eq!(mouse_downs(&outs), 0, "no press may ever have happened");
+    assert_eq!(mouse_ups(&outs), 0);
+    let evs = synth_events(&outs);
+    let ids: Vec<i32> = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID)
+        .map(|e| e.value)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "all four fingers must be introduced to the clone: {evs:?}"
+    );
+    assert!(
+        evs.contains(&Ev::new(EV_KEY, BTN_TOUCH, 1)),
+        "real tool state must accompany the handoff: {evs:?}"
+    );
+
+    // and the rest of the swipe relays live
+    let outs = sim.frame_at(10, &cat(&[&mv(0, 100, 200), &mv(1, 200, 200)]));
+    assert!(
+        !synth_events(&outs).is_empty(),
+        "post-handoff motion must relay"
+    );
+    assert_eq!(mouse_downs(&outs), 0);
+}
+
+/// If the drag already pressed (motion happened before the 4th finger),
+/// the abort must still recover: release the button and hand off.
+#[test]
+fn late_4th_after_motion_releases_and_hands_off() {
+    let mut sim = Sim::new();
+    commit_drag_only(&mut sim);
+    let outs = sim.frame_at(10, &mv(0, 520, 500)); // motion presses
+    assert_eq!(mouse_downs(&outs), 1);
+
+    let outs = sim.frame_at(10, &down(3, 9, 400, 100));
+    assert_eq!(mouse_ups(&outs), 1, "held button must be released on abort");
+    let up_idx = outs
+        .iter()
+        .position(|o| matches!(o, Output::MouseUp))
+        .unwrap();
+    let synth_idx = outs
+        .iter()
+        .position(|o| matches!(o, Output::EmitSynth(_)))
+        .unwrap();
+    assert!(
+        up_idx < synth_idx,
+        "release before the compositor sees the touch"
+    );
+}
+
+/// The deferred press must not change what a drag feels like: the press
+/// lands in the same output batch as (and before) the first motion.
+#[test]
+fn deferred_press_lands_before_first_motion() {
+    let mut sim = Sim::new();
+    commit_drag_only(&mut sim);
+    let outs = sim.frame_at(10, &mv(0, 510, 500));
+    let down_idx = outs.iter().position(|o| matches!(o, Output::MouseDown));
+    let move_idx = outs
+        .iter()
+        .position(|o| matches!(o, Output::MouseMove { .. }));
+    assert!(down_idx.is_some() && move_idx.is_some());
+    assert!(
+        down_idx < move_idx,
+        "MouseDown must precede the motion it enables"
+    );
+}
+
+/// A stationary 3-finger hold must still press (after the grace) so
+/// press-and-hold semantics survive the deferral...
+#[test]
+fn stationary_hold_presses_after_grace() {
+    let mut sim = Sim::new();
+    let outs = commit_drag_only(&mut sim);
+    assert_eq!(mouse_downs(&outs), 0);
+    let outs = sim.tick(80); // grace (75ms) expires
+    assert_eq!(
+        mouse_downs(&outs),
+        1,
+        "stationary drag must press after the grace"
+    );
+}
+
+/// ...and a stationary 3-finger touch that lifts before the grace still
+/// produces its click (press+release at liftoff), preserving the old
+/// "3-finger hold = click" behavior.
+#[test]
+fn stationary_hold_lifting_before_grace_still_clicks() {
+    let mut sim = Sim::new();
+    commit_drag_only(&mut sim);
+    let outs = sim.frame_at(20, &cat(&[&up(0), &up(1), &up(2)])); // lift inside grace
+    assert_eq!(
+        mouse_downs(&outs),
+        1,
+        "the owed click must be pressed at liftoff"
+    );
+    assert_eq!(mouse_ups(&outs), 1, "and released");
+    let d = outs
+        .iter()
+        .position(|o| matches!(o, Output::MouseDown))
+        .unwrap();
+    let u = outs
+        .iter()
+        .position(|o| matches!(o, Output::MouseUp))
+        .unwrap();
+    assert!(d < u);
 }
 
 // =========================================================================
@@ -646,7 +802,13 @@ fn next_deadline_tracks_state() {
     );
 
     let mut sim = Sim::new();
-    start_drag(&mut sim);
+    commit_drag_only(&mut sim);
+    let d = sim
+        .m
+        .next_deadline()
+        .expect("press-grace deadline while unmoved");
+    assert_eq!(d, sim.now + Duration::from_millis(75));
+    sim.tick(80); // grace fires -> pressed
     assert_eq!(sim.m.next_deadline(), None, "dragging: purely event-driven");
 
     let mut sim = Sim::with_delay(300);
