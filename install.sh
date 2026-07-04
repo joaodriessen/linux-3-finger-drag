@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 ###########################
 # linux-three-finger-drag #
 #   Installation Script   #
@@ -7,7 +8,7 @@
 # this also makes sure the printed lines wrap on spaces, not in the
 # middle of words
 echo-mls() {
-    echo -e $1 | fold -s -w $(( $(tput cols) - 5 ))
+    echo -e "$1" | fold -s -w $(( $(tput cols) - 5 ))
 }
 
 # don't run if not root
@@ -42,7 +43,7 @@ mkdir -p /etc/udev/rules.d   # make if not already extant
 cp ./60-uinput.rules /etc/udev/rules.d/
 
 ## Add user to "input" group to read /dev/input devices directly
-gpasswd --add $SUDO_USER input > /dev/null
+gpasswd --add "$SUDO_USER" input > /dev/null
 
 ## Automatically load uinput kernel module
 ## Not necessary on Ubuntu-based distros,
@@ -61,7 +62,7 @@ echo
 ## this needs to be done as the user, or else is messes up the permissions.
 ## Cargo should never really be run as root anyway.
 REPO_DIR=$PWD
-su -l $SUDO_USER -c "cd $REPO_DIR; cargo build --release"
+su -l "$SUDO_USER" -c "cd '$REPO_DIR'; cargo build --release"
 CARGO_EXIT_CODE=$?
 
 if [ $CARGO_EXIT_CODE -ne 0 ]; then
@@ -102,7 +103,7 @@ fi
 # Set up config file
 # Has to be done as non-root user, so the file is accessible to the user
 echo -n "Installing config file...                       "
-su $SUDO_USER -c '\
+su "$SUDO_USER" -c '\
     mkdir -p ~/.config/linux-3-finger-drag; \
     cp 3fd-config.json ~/.config/linux-3-finger-drag '
 echo -e "[\e[0;32m DONE \e[0m]"
@@ -113,12 +114,13 @@ echo -e "[\e[0;32m DONE \e[0m]"
 # 7b. Installing SystemD service
 # If using SystemD as the init system
 echo -n "Installing/enabling SystemD user unit...        "
-if [[ -n $(ps -p 1 | grep systemd) ]]; then
+if ps -p 1 | grep -q systemd; then
 
     # define user-level service
     # made as non-root user
-    su $SUDO_USER -c '\
-        mkdir -p $HOME/.config/systemd/user; \
+    # shellcheck disable=SC2016  # $HOME must expand in the TARGET user's shell
+    su "$SUDO_USER" -c '\
+        mkdir -p "$HOME"/.config/systemd/user; \
         cp three-finger-drag.service $HOME/.config/systemd/user/; \
         systemctl --user enable --now three-finger-drag.service '
     echo -e "[\e[0;32m DONE \e[0m]"
@@ -141,7 +143,7 @@ echo
 echo "This installation requires a reboot to complete (for the group modification)."
 echo
 echo -n "Would you like to reboot now? (y/n, default y) "
-read answer
+read -r answer
 
 case "$answer" in 
     y | "")

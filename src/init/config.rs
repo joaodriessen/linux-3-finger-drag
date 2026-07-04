@@ -208,10 +208,84 @@ pub fn parse_config_file() -> Result<Configuration, std::io::Error> {
     Ok(config)
 }
 
+impl Configuration {
+    /// Clamp every knob into a range where the state machine behaves
+    /// sensibly, warning about anything adjusted. Garbage in a config
+    /// file must degrade to a working touchpad, never a broken one
+    /// (a bad `acceleration` inverting drags, a `dragEndDelay` of an
+    /// hour holding the button down, a `probeDelay` longer than the
+    /// entry window starving classification...).
+    fn sanitize(mut self) -> Configuration {
+        let fix = |what: &str, before: String, after: String| {
+            println!(
+                "[PRE-LOG: WARNING]: config `{what}` = {before} is out of range; using {after}"
+            );
+        };
+        if !self.acceleration.is_finite() || self.acceleration <= 0.0 {
+            fix(
+                "acceleration",
+                format!("{}", self.acceleration),
+                "1.0".into(),
+            );
+            self.acceleration = 1.0;
+        } else if !(0.05..=20.0).contains(&self.acceleration) {
+            let clamped = self.acceleration.clamp(0.05, 20.0);
+            fix(
+                "acceleration",
+                format!("{}", self.acceleration),
+                format!("{clamped}"),
+            );
+            self.acceleration = clamped;
+        }
+        if self.probe_delay > Duration::from_millis(200) {
+            fix(
+                "probeDelay",
+                format!("{:?}", self.probe_delay),
+                "200ms".into(),
+            );
+            self.probe_delay = Duration::from_millis(200);
+        }
+        if self.entry_debounce > Duration::from_millis(500) {
+            fix(
+                "entryDebounce",
+                format!("{:?}", self.entry_debounce),
+                "500ms".into(),
+            );
+            self.entry_debounce = Duration::from_millis(500);
+        }
+        if self.entry_debounce < self.probe_delay {
+            fix(
+                "entryDebounce",
+                format!("{:?} (< probeDelay)", self.entry_debounce),
+                format!("{:?}", self.probe_delay),
+            );
+            self.entry_debounce = self.probe_delay;
+        }
+        if self.press_grace > Duration::from_millis(1000) {
+            fix(
+                "pressGrace",
+                format!("{:?}", self.press_grace),
+                "1000ms".into(),
+            );
+            self.press_grace = Duration::from_millis(1000);
+        }
+        if self.drag_end_delay > Duration::from_millis(5000) {
+            fix(
+                "dragEndDelay",
+                format!("{:?}", self.drag_end_delay),
+                "5000ms".into(),
+            );
+            self.drag_end_delay = Duration::from_millis(5000);
+        }
+        self
+    }
+}
+
 pub fn init_cfg() -> Configuration {
     println!("[PRE-LOG: INFO]: Loading configuration...");
     let configs = match parse_config_file() {
         Ok(cfg) => {
+            let cfg = cfg.sanitize();
             println!("[PRE-LOG: INFO]: Successfully loaded your configuration (with defaults for unspecified values): \n{:#?}", &cfg);
             cfg
         }

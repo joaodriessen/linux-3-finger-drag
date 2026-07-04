@@ -278,7 +278,7 @@ impl GestureMachine {
         }
 
         let count = self.active_count();
-        let start = self.touch_start.unwrap();
+        let start = self.touch_start.expect("guarded by is_none() above");
 
         if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
             self.settled = true;
@@ -540,7 +540,7 @@ impl GestureMachine {
             return;
         }
 
-        let start = self.touch_start.unwrap();
+        let start = self.touch_start.expect("set above when the touch began");
 
         if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
             // Still just one finger after a short probe: ordinary
@@ -741,5 +741,7 @@ impl GestureMachine {
     }
 }
 
+#[cfg(test)]
+mod fuzz;
 #[cfg(test)]
 mod tests;

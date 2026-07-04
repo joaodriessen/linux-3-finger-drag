@@ -39,13 +39,18 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or_else(|| "--device requires a path argument".to_string())?,
                 );
             }
+            "--version" | "-V" => {
+                println!("linux-3-finger-drag {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!(
                     "linux-3-finger-drag [--device /dev/input/eventN]\n\n\
                     Turns a sustained 3-finger touchpad touch into a drag \
                     (mouse-button-held movement).\n\n\
                       --device PATH   proxy this evdev device instead of \
-                    auto-discovering the touchpad"
+                    auto-discovering the touchpad\n\
+                      --version       print the version and exit"
                 );
                 std::process::exit(0);
             }

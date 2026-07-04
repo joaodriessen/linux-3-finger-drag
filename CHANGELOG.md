@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.2.0 - 2026-07-04
+
+Production-hardening release.
+
+### Added
+
+- **Randomized invariant fuzzer**: 96 deterministic scenarios x 2500
+  steps of chaotic multi-finger input (with realistic tool-bit
+  reporting and random SYN_DROPPED resyncs), with a shadow model of the
+  synthetic clone verifying after every step that the clone's slot
+  state matches the machine's belief, button presses/releases pair
+  correctly, the clone never shows more fingers than the real pad, and
+  quiescence leaves no phantom touches, stuck tool bits, held button,
+  or scheduled wakeups. Mutation-tested (a deliberately broken machine
+  fails it immediately).
+- Config sanitization: out-of-range values (negative/zero/huge
+  acceleration, probeDelay > entryDebounce, multi-second delays) are
+  clamped with a logged warning instead of being applied blindly --
+  garbage in the config file can no longer produce a broken touchpad.
+- `--version` flag.
+- GitHub Actions CI: fmt, clippy -D warnings, tests (unit + fuzzer),
+  release build.
+
+### Changed
+
+- install.sh is shellcheck-clean; remaining unwraps in the state
+  machine converted to documented expects.
+
 ## 2.1.0 - 2026-07-04
 
 Fixes flaky 4-finger vertical swipes (overview/grid gestures sometimes
