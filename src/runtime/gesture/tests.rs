@@ -726,6 +726,48 @@ fn growth_to_four_activates_scaling_mid_touch() {
     );
 }
 
+/// THE MISSING-TOUCH-SIZE REGRESSION: libinput filters out contacts
+/// that never report a size (ABS_MT_TOUCH_MAJOR -- Apple pads have
+/// explicit touch-size quirks). Both the fresh-touch intro and the
+/// scaled relay must forward the auxiliary axes, or the compositor
+/// ignores every touch and gestures die entirely.
+#[test]
+fn intro_and_scaled_relay_forward_touch_size() {
+    const MAJOR: u16 = 0x30;
+    let mut sim = Sim::with_scale(0.5);
+    let mut f = Vec::new();
+    for (slot, id, x) in [(0, 1, 1000), (1, 2, 1200), (2, 3, 1400), (3, 4, 1600)] {
+        f.extend(down(slot, id, x, 700));
+        f.push(Ev::abs(MAJOR, 350 + slot));
+    }
+    let outs = sim.frame(&f); // 4 fingers: settles instantly -> intro
+    let evs = synth_events(&outs);
+    for slot in 0..4 {
+        assert!(
+            evs.contains(&Ev::abs(MAJOR, 350 + slot)),
+            "intro must carry each contact's touch size: {evs:?}"
+        );
+    }
+
+    // size updates keep flowing during scaled relay
+    let outs = sim.frame_at(10, &[Ev::abs(ABS_MT_SLOT, 0), Ev::abs(MAJOR, 420)]);
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(MAJOR, 420)),
+        "scaled relay must forward size updates unscaled: {evs:?}"
+    );
+
+    // and a finger landing mid-gesture carries its size too
+    let mut late = down(4, 9, 800, 700);
+    late.push(Ev::abs(MAJOR, 500));
+    let outs = sim.frame_at(10, &late);
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(MAJOR, 500)),
+        "a finger landing during scaled relay must carry its size: {evs:?}"
+    );
+}
+
 // =========================================================================
 // drag-lock (drag_end_delay > 0)
 // =========================================================================

@@ -149,6 +149,7 @@ impl Hand {
             Ev::abs(ABS_MT_TRACKING_ID, id),
             Ev::abs(ABS_MT_POSITION_X, x),
             Ev::abs(ABS_MT_POSITION_Y, y),
+            Ev::abs(ABS_MT_TOUCH_MAJOR, 200 + rng.below(300) as i32),
         ];
         evs.extend(self.tool_events());
         evs

@@ -46,6 +46,14 @@ pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
 pub const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
 
+/// Per-slot auxiliary MT axes forwarded alongside positions: contact
+/// size/width/orientation/distance/pressure. libinput decides whether a
+/// contact is a real touch partly from these (Apple pads have explicit
+/// touch-size quirks) -- a clone touch that never reports a size is
+/// filtered out entirely, killing gestures.
+pub const MT_AUX_CODES: [u16; 7] = [0x30, 0x31, 0x32, 0x33, 0x34, 0x37, 0x3a];
+const AUX_UNSEEN: i32 = i32::MIN;
+
 /// Hard upper bound on tracked slots; the effective count comes from the
 /// device's ABS_MT_SLOT range at construction.
 pub const MAX_SLOTS: usize = 16;
@@ -130,9 +138,21 @@ struct Slot {
     tracking_id: i32,
     x: i32,
     y: i32,
-    /// Contact size (ABS_MT_TOUCH_MAJOR), where the device reports it.
-    /// Diagnostic: thumbs and palm edges are much larger than fingertips.
-    touch_major: i32,
+    /// Values of the auxiliary MT axes (MT_AUX_CODES order); AUX_UNSEEN
+    /// until the device first reports one. touch_major (index 0) doubles
+    /// as the thumb/palm diagnostic (thumbs are much larger than
+    /// fingertips).
+    aux: [i32; MT_AUX_CODES.len()],
+}
+
+impl Slot {
+    fn touch_major(&self) -> i32 {
+        if self.aux[0] == AUX_UNSEEN {
+            0
+        } else {
+            self.aux[0]
+        }
+    }
 }
 
 impl Default for Slot {
@@ -141,7 +161,7 @@ impl Default for Slot {
             tracking_id: -1,
             x: 0,
             y: 0,
-            touch_major: 0,
+            aux: [AUX_UNSEEN; MT_AUX_CODES.len()],
         }
     }
 }
@@ -162,6 +182,9 @@ struct ScaleSlot {
     virt: (f64, f64),
     /// Real position the last delta was taken from.
     last_real: (i32, i32),
+    /// Auxiliary axis values the clone was last told (size/pressure/...,
+    /// forwarded UNSCALED -- libinput filters out touches with no size).
+    clone_aux: [i32; MT_AUX_CODES.len()],
 }
 
 impl Default for ScaleSlot {
@@ -171,6 +194,7 @@ impl Default for ScaleSlot {
             clone_pos: (0, 0),
             virt: (0.0, 0.0),
             last_real: (0, 0),
+            clone_aux: [AUX_UNSEEN; MT_AUX_CODES.len()],
         }
     }
 }
@@ -367,8 +391,11 @@ impl GestureMachine {
                 ABS_MT_TRACKING_ID => self.slots[self.current_slot].tracking_id = ev.value,
                 ABS_MT_POSITION_X => self.slots[self.current_slot].x = ev.value,
                 ABS_MT_POSITION_Y => self.slots[self.current_slot].y = ev.value,
-                ABS_MT_TOUCH_MAJOR => self.slots[self.current_slot].touch_major = ev.value,
-                _ => {}
+                code => {
+                    if let Some(i) = MT_AUX_CODES.iter().position(|&c| c == code) {
+                        self.slots[self.current_slot].aux[i] = ev.value;
+                    }
+                }
             }
         }
         // 2. decide what to do about it
@@ -387,7 +414,7 @@ impl GestureMachine {
                     tracking_id: id,
                     x,
                     y,
-                    touch_major: 0,
+                    aux: [AUX_UNSEEN; MT_AUX_CODES.len()],
                 },
                 None => Slot::default(),
             };
@@ -662,7 +689,7 @@ impl GestureMachine {
                     self.slots[s].tracking_id,
                     self.slots[s].x,
                     self.slots[s].y,
-                    self.slots[s].touch_major
+                    self.slots[s].touch_major()
                 )
             })
             .collect();
@@ -756,6 +783,7 @@ impl GestureMachine {
                 ss.clone_pos = (real.x, real.y);
                 ss.virt = (real.x as f64, real.y as f64);
                 ss.last_real = (real.x, real.y);
+                ss.clone_aux = real.aux;
             } else {
                 *ss = ScaleSlot::default();
             }
@@ -789,18 +817,32 @@ impl GestureMachine {
                     frame.push(Ev::abs(ABS_MT_TRACKING_ID, real.tracking_id));
                     frame.push(Ev::abs(ABS_MT_POSITION_X, real.x));
                     frame.push(Ev::abs(ABS_MT_POSITION_Y, real.y));
+                    for (i, &code) in MT_AUX_CODES.iter().enumerate() {
+                        if real.aux[i] != AUX_UNSEEN {
+                            frame.push(Ev::abs(code, real.aux[i]));
+                            ss.clone_aux[i] = real.aux[i];
+                        }
+                    }
                 } else {
                     ss.virt.0 += f64::from(real.x - ss.last_real.0) * scale;
                     ss.virt.1 += f64::from(real.y - ss.last_real.1) * scale;
                     ss.last_real = (real.x, real.y);
                     let v = (ss.virt.0.round() as i32, ss.virt.1.round() as i32);
-                    if v != ss.clone_pos {
+                    let aux_changed = (0..MT_AUX_CODES.len())
+                        .any(|i| real.aux[i] != AUX_UNSEEN && real.aux[i] != ss.clone_aux[i]);
+                    if v != ss.clone_pos || aux_changed {
                         frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
                         if v.0 != ss.clone_pos.0 {
                             frame.push(Ev::abs(ABS_MT_POSITION_X, v.0));
                         }
                         if v.1 != ss.clone_pos.1 {
                             frame.push(Ev::abs(ABS_MT_POSITION_Y, v.1));
+                        }
+                        for (i, &code) in MT_AUX_CODES.iter().enumerate() {
+                            if real.aux[i] != AUX_UNSEEN && real.aux[i] != ss.clone_aux[i] {
+                                frame.push(Ev::abs(code, real.aux[i]));
+                                ss.clone_aux[i] = real.aux[i];
+                            }
                         }
                         ss.clone_pos = v;
                     }
@@ -961,6 +1003,11 @@ impl GestureMachine {
                 dump.push(Ev::abs(ABS_MT_TRACKING_ID, s.tracking_id));
                 dump.push(Ev::abs(ABS_MT_POSITION_X, s.x));
                 dump.push(Ev::abs(ABS_MT_POSITION_Y, s.y));
+                for (i, &code) in MT_AUX_CODES.iter().enumerate() {
+                    if s.aux[i] != AUX_UNSEEN {
+                        dump.push(Ev::abs(code, s.aux[i]));
+                    }
+                }
             }
         }
         dump
