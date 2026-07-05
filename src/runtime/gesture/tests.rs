@@ -324,6 +324,55 @@ fn growth_to_three_after_settle_becomes_drag_with_clean_release() {
     );
 }
 
+/// THE TOUCHDOWN-BURST BUG: uinput regenerates timestamps, so replaying
+/// a buffered touch's history delivers all its motion in ~0ms --
+/// libinput reads near-infinite velocity, the accel curve maxes out,
+/// and fast 4-finger swipes leap at onset. A live touch that settles as
+/// "not ours" must be introduced at its CURRENT position only, with the
+/// buffered motion discarded.
+#[test]
+fn live_settle_introduces_fresh_touch_without_replaying_motion() {
+    let mut sim = Sim::new();
+    sim.frame(&down(0, 1, 100, 100));
+    sim.frame_at(5, &mv(0, 300, 100)); // fast motion inside the probe window
+    sim.frame_at(5, &mv(0, 500, 100));
+    let outs = sim.tick(10); // probe closes: touch settles live
+
+    let evs = synth_events(&outs);
+    let xs: Vec<i32> = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_POSITION_X)
+        .map(|e| e.value)
+        .collect();
+    assert_eq!(
+        xs,
+        vec![500],
+        "only the CURRENT position may be introduced -- history replay \
+        bursts motion through libinput at infinite velocity: {evs:?}"
+    );
+
+    // 4-finger case: buffered touchdown motion must also be discarded
+    let mut sim = Sim::new();
+    sim.frame(&cat(&[
+        &down(0, 1, 100, 100),
+        &down(1, 2, 200, 100),
+        &down(2, 3, 300, 100),
+    ]));
+    sim.frame_at(8, &cat(&[&mv(0, 200, 100), &mv(1, 300, 100)])); // swipe already moving
+    let outs = sim.frame_at(8, &down(3, 4, 700, 100)); // 4th finger -> settles
+    let evs = synth_events(&outs);
+    let xs: Vec<i32> = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_POSITION_X)
+        .map(|e| e.value)
+        .collect();
+    assert_eq!(
+        xs,
+        vec![200, 300, 300, 700],
+        "the 4-finger intro must carry current positions only: {evs:?}"
+    );
+}
+
 // =========================================================================
 // deferred press & the late-4th-finger bailout
 // =========================================================================

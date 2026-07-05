@@ -44,6 +44,7 @@ pub const ABS_MT_SLOT: u16 = 0x2f;
 pub const ABS_MT_TRACKING_ID: u16 = 0x39;
 pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
+pub const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
 
 /// Hard upper bound on tracked slots; the effective count comes from the
 /// device's ABS_MT_SLOT range at construction.
@@ -122,6 +123,9 @@ struct Slot {
     tracking_id: i32,
     x: i32,
     y: i32,
+    /// Contact size (ABS_MT_TOUCH_MAJOR), where the device reports it.
+    /// Diagnostic: thumbs and palm edges are much larger than fingertips.
+    touch_major: i32,
 }
 
 impl Default for Slot {
@@ -130,6 +134,7 @@ impl Default for Slot {
             tracking_id: -1,
             x: 0,
             y: 0,
+            touch_major: 0,
         }
     }
 }
@@ -158,6 +163,11 @@ pub struct GestureMachine {
     /// While a committed drag hasn't moved yet: when to press the button
     /// anyway (see [`Timing::press_grace`]). Cleared once pressed.
     press_deadline: Option<Instant>,
+    /// Diagnostics for the current drag: commit time, total |px| emitted,
+    /// and the largest single-frame delta.
+    drag_commit_time: Option<Instant>,
+    drag_px_total: (i64, i64),
+    drag_px_max_frame: i32,
 
     /// Last EV_KEY values seen from the REAL device (BTN_TOUCH,
     /// BTN_TOOL_*...). The truth about tool state on the pad.
@@ -199,6 +209,9 @@ impl GestureMachine {
             drag_last_pos: None,
             carry: (0.0, 0.0),
             press_deadline: None,
+            drag_commit_time: None,
+            drag_px_total: (0, 0),
+            drag_px_max_frame: 0,
             real_keys: Vec::new(),
             clone_keys: Vec::new(),
             pending: Vec::new(),
@@ -282,7 +295,7 @@ impl GestureMachine {
 
         if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
             self.settled = true;
-            self.flush_pending(&mut out);
+            self.settle_live_touch(&mut out);
             return out;
         }
         if now >= start + self.timing.entry_debounce {
@@ -312,6 +325,7 @@ impl GestureMachine {
                 ABS_MT_TRACKING_ID => self.slots[self.current_slot].tracking_id = ev.value,
                 ABS_MT_POSITION_X => self.slots[self.current_slot].x = ev.value,
                 ABS_MT_POSITION_Y => self.slots[self.current_slot].y = ev.value,
+                ABS_MT_TOUCH_MAJOR => self.slots[self.current_slot].touch_major = ev.value,
                 _ => {}
             }
         }
@@ -331,6 +345,7 @@ impl GestureMachine {
                     tracking_id: id,
                     x,
                     y,
+                    touch_major: 0,
                 },
                 None => Slot::default(),
             };
@@ -412,6 +427,15 @@ impl GestureMachine {
         // the moment they lift too.
         if self.suppressing {
             if count == 0 {
+                if let Some(t0) = self.drag_commit_time.take() {
+                    debug!(
+                        "DRAG END after {}ms: moved |{}|,|{}| px, max frame delta {} px",
+                        now.duration_since(t0).as_millis(),
+                        self.drag_px_total.0,
+                        self.drag_px_total.1,
+                        self.drag_px_max_frame
+                    );
+                }
                 self.suppressing = false;
                 self.drag_ref_slot = None;
                 self.drag_last_pos = None;
@@ -461,20 +485,7 @@ impl GestureMachine {
                 self.press_deadline = None;
                 self.settled = true; // continues as an ordinary live touch
                 self.release_button(out);
-                // Introduce the touch to the clone as a fresh, complete,
-                // consistent touchdown: all live slots plus the real
-                // pad's current tool state (BTN_TOUCH/BTN_TOOL_*).
-                let mut intro = self.active_slot_dump();
-                for i in 0..self.real_keys.len() {
-                    let (code, value) = self.real_keys[i];
-                    if Self::key_value(&self.clone_keys, code) != value {
-                        intro.push(Ev::new(EV_KEY, code, value));
-                        Self::note_key(&mut self.clone_keys, code, value);
-                    }
-                }
-                intro.push(Ev::syn());
-                self.mark_relayed();
-                out.push(Output::EmitSynth(intro));
+                self.intro_current_touch(out);
                 return;
             }
             self.drive_drag(&active, out);
@@ -536,7 +547,7 @@ impl GestureMachine {
             // Unambiguously bigger than a 3-finger drag could ever be --
             // no need to wait out the rest of the window.
             self.settled = true;
-            self.flush_pending(out);
+            self.settle_live_touch(out);
             return;
         }
 
@@ -549,7 +560,7 @@ impl GestureMachine {
             // touch-lift-reposition cycle of normal cursor use would add
             // a felt hitch.
             self.settled = true;
-            self.flush_pending(out);
+            self.settle_live_touch(out);
             return;
         }
 
@@ -569,7 +580,7 @@ impl GestureMachine {
             return;
         }
         self.settled = true;
-        self.flush_pending(out);
+        self.settle_live_touch(out);
     }
 
     /// Commit the current touch as a 3-finger drag. The button press is
@@ -577,7 +588,32 @@ impl GestureMachine {
     /// press_grace expires -- so a late 4th finger (fast 4-finger swipe)
     /// can still abort without a phantom click having been sent.
     fn commit_drag(&mut self, active: &[usize], now: Instant, out: &mut Vec<Output>) {
-        debug!("3-finger touch committed as a drag");
+        let elapsed = self
+            .touch_start
+            .map(|t| now.duration_since(t).as_millis())
+            .unwrap_or(0);
+        let contacts: Vec<String> = active
+            .iter()
+            .map(|&s| {
+                format!(
+                    "slot{}(id={} x={} y={} major={})",
+                    s,
+                    self.slots[s].tracking_id,
+                    self.slots[s].x,
+                    self.slots[s].y,
+                    self.slots[s].touch_major
+                )
+            })
+            .collect();
+        debug!(
+            "DRAG COMMIT after {}ms (touch_max={}): {}",
+            elapsed,
+            self.touch_max,
+            contacts.join(" ")
+        );
+        self.drag_commit_time = Some(now);
+        self.drag_px_total = (0, 0);
+        self.drag_px_max_frame = 0;
         self.settled = true;
         self.enter_suppress(out);
         if !self.held {
@@ -600,6 +636,41 @@ impl GestureMachine {
             out.push(Output::EmitSynth(flushed));
         }
         self.mark_relayed();
+    }
+
+    /// Introduce the current, live touch to the clone as a fresh,
+    /// complete, consistent touchdown: every live slot at its CURRENT
+    /// position, plus the real pad's current tool state
+    /// (BTN_TOUCH/BTN_TOOL_*).
+    fn intro_current_touch(&mut self, out: &mut Vec<Output>) {
+        let mut intro = self.active_slot_dump();
+        for i in 0..self.real_keys.len() {
+            let (code, value) = self.real_keys[i];
+            if Self::key_value(&self.clone_keys, code) != value {
+                intro.push(Ev::new(EV_KEY, code, value));
+                Self::note_key(&mut self.clone_keys, code, value);
+            }
+        }
+        intro.push(Ev::syn());
+        self.mark_relayed();
+        out.push(Output::EmitSynth(intro));
+    }
+
+    /// A still-alive touch has settled as "not ours": hand it to the
+    /// compositor as a fresh touchdown at its CURRENT state, discarding
+    /// the buffered history. Replaying the buffer would deliver all its
+    /// motion in one burst -- uinput regenerates timestamps, so libinput
+    /// sees the buffered movement at near-infinite velocity, the accel
+    /// curve maxes out, and gestures (especially fast 4-finger swipes)
+    /// leap at onset. A quick tap that already ENDED still uses
+    /// flush_pending: its verbatim replay is what keeps tap gestures
+    /// working, and taps carry no meaningful motion to burst.
+    fn settle_live_touch(&mut self, out: &mut Vec<Output>) {
+        if self.lock_deadline.take().is_some() {
+            self.release_button(out);
+        }
+        self.pending.clear();
+        self.intro_current_touch(out);
     }
 
     fn relay_frame(&mut self, frame: &[Ev], out: &mut Vec<Output>) {
@@ -715,6 +786,9 @@ impl GestureMachine {
                 // real drag motion: the deferred press (if still pending)
                 // must land before the movement it accompanies
                 self.press_button(out);
+                self.drag_px_total.0 += dx.unsigned_abs() as i64;
+                self.drag_px_total.1 += dy.unsigned_abs() as i64;
+                self.drag_px_max_frame = self.drag_px_max_frame.max(dx.abs().max(dy.abs()));
                 out.push(Output::MouseMove { dx, dy });
             }
         } else {
