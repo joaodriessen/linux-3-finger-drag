@@ -77,12 +77,19 @@ const FLICK_HI_PADS_S: f64 = 1.8;
 /// including whatever was lost to recognition latency and late-landing
 /// fingers. Step cadence, per-step decay, minimum speed to keep
 /// gliding, and a hard time cap.
-/// A 3-finger touch moving faster than this during its entry window is
-/// held back from drag commitment (a fast 4-finger flick's 4th finger
-/// often registers 60-170ms late; measured drags start ~0.3 pads/s,
-/// flicks ~2.0). The hold lasts at most FAST3_WINDOW from touchdown.
-const FAST3_VEL_PADS_S: f64 = 0.45;
-const FAST3_WINDOW: Duration = Duration::from_millis(160);
+/// A 2-3 finger touch moving faster than this during its entry window
+/// is still ASSEMBLING: on fast flicks, fingers register up to ~170ms
+/// apart (measured), and settling early poisons the compositor's
+/// gesture engine with a brief small-finger-count touch that then
+/// vanishes. Such touches stay buffered until they stop growing or the
+/// window expires (then: 3 fingers -> drag, 2 -> scroll). Measured:
+/// deliberate drags start ~0.3 pads/s, flicks ~2.0.
+const FAST_ASSEMBLY_VEL_PADS_S: f64 = 0.45;
+const FAST_ASSEMBLY_WINDOW: Duration = Duration::from_millis(160);
+/// A fast LONE finger gets a slightly longer probe (a fast flick's 2nd
+/// finger lands ~25ms after the 1st); slow/precise pointer motion keeps
+/// the ordinary probe latency.
+const FAST1_WINDOW: Duration = Duration::from_millis(40);
 
 const GLIDE_STEP: Duration = Duration::from_millis(10);
 const GLIDE_DECAY: f64 = 0.82;
@@ -304,9 +311,9 @@ pub struct GestureMachine {
     /// simultaneous undercounts them).
     touch_distinct: u32,
     touch_travel: (i64, i64),
-    /// A fast 3-finger touch being held back from drag commitment,
-    /// waiting for a possible late 4th finger.
-    fast3_hold: bool,
+    /// A fast 2-3 finger touch being held back from settling, waiting
+    /// for possible late fingers (see FAST_ASSEMBLY_*).
+    fast_hold: bool,
     /// Mean per-finger displacement accumulated before the gesture was
     /// recognized; paid out during the glide so the compositor receives
     /// the full physical travel.
@@ -354,7 +361,7 @@ impl GestureMachine {
             touch_max: 0,
             touch_distinct: 0,
             touch_travel: (0, 0),
-            fast3_hold: false,
+            fast_hold: false,
             pending_debt: (0.0, 0.0),
             settled: false,
             held: false,
@@ -393,8 +400,12 @@ impl GestureMachine {
         }
         if let Some(start) = self.touch_start {
             if !self.settled {
-                let window = if self.fast3_hold {
-                    FAST3_WINDOW
+                let window = if self.fast_hold {
+                    if self.touch_max <= 1 {
+                        FAST1_WINDOW
+                    } else {
+                        FAST_ASSEMBLY_WINDOW
+                    }
                 } else if self.touch_max <= 1 {
                     self.timing.probe_delay
                 } else {
@@ -447,6 +458,14 @@ impl GestureMachine {
         let start = self.touch_start.expect("guarded by is_none() above");
 
         if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
+            let el_s = now.duration_since(start).as_secs_f64().max(0.001);
+            let vel = (self.touch_travel.0 as f64 / self.x_extent / el_s)
+                .max(self.touch_travel.1 as f64 / self.y_extent / el_s);
+            if vel > FAST_ASSEMBLY_VEL_PADS_S && now < start + FAST1_WINDOW {
+                self.fast_hold = true;
+                return out;
+            }
+            self.fast_hold = false;
             self.settled = true;
             self.settle_live_touch(&mut out);
             return out;
@@ -716,7 +735,7 @@ impl GestureMachine {
         if count == 0 {
             let had_pending = self.touch_start.is_some() && !self.settled;
             self.log_touch_autopsy(now, if had_pending { "tap" } else { "relayed" });
-            self.fast3_hold = false;
+            self.fast_hold = false;
             self.touch_start = None;
             self.touch_max = 0;
             self.settled = false;
@@ -799,7 +818,18 @@ impl GestureMachine {
             // pointer movement, by far the most common case. Go live now
             // rather than waiting out the full entry_debounce, or every
             // touch-lift-reposition cycle of normal cursor use would add
-            // a felt hitch.
+            // a felt hitch. EXCEPT a finger already at flick speed: a
+            // fast flick's 2nd finger lands ~25ms behind the 1st, and
+            // settling now would leak a 1-finger prelude to the
+            // compositor -- give it until FAST1_WINDOW.
+            let el_s = now.duration_since(start).as_secs_f64().max(0.001);
+            let vel = (self.touch_travel.0 as f64 / self.x_extent / el_s)
+                .max(self.touch_travel.1 as f64 / self.y_extent / el_s);
+            if vel > FAST_ASSEMBLY_VEL_PADS_S && now < start + FAST1_WINDOW {
+                self.fast_hold = true;
+                return;
+            }
+            self.fast_hold = false;
             self.settled = true;
             self.settle_live_touch(out);
             return;
@@ -814,36 +844,42 @@ impl GestureMachine {
     /// touch held stably at exactly 3 fingers the whole time, otherwise
     /// release it to the compositor as an ordinary gesture.
     fn resolve_touch_decision(&mut self, count: usize, now: Instant, out: &mut Vec<Output>) {
-        if count == 3 && self.touch_max == 3 && self.touch_distinct <= 3 {
-            let elapsed = self
-                .touch_start
-                .map(|t| now.duration_since(t))
-                .unwrap_or_default();
-            // A 3-finger touch already moving at flick speed is very
-            // likely a 4-finger flick whose last finger hasn't
-            // registered yet (measured: 60-170ms late on fast vertical
-            // flicks). Hold off drag commitment and keep buffering; a
-            // 4th contact settles it as a gesture, the window running
-            // out settles it as a (violent) drag.
-            let el_s = elapsed.as_secs_f64().max(0.001);
-            let vel = (self.touch_travel.0 as f64 / 3.0 / self.x_extent / el_s)
-                .max(self.touch_travel.1 as f64 / 3.0 / self.y_extent / el_s);
-            if elapsed < FAST3_WINDOW && vel > FAST3_VEL_PADS_S {
-                if !self.fast3_hold {
-                    self.fast3_hold = true;
-                    debug!(
-                        "fast 3-finger touch ({vel:.2} pads/s): holding drag commit,                         waiting for a possible late 4th finger"
-                    );
-                }
-                return;
+        let elapsed = self
+            .touch_start
+            .map(|t| now.duration_since(t))
+            .unwrap_or_default();
+        let el_s = elapsed.as_secs_f64().max(0.001);
+        let fingers = count.max(1) as f64;
+        let vel = (self.touch_travel.0 as f64 / fingers / self.x_extent / el_s)
+            .max(self.touch_travel.1 as f64 / fingers / self.y_extent / el_s);
+        // A fast-moving 2-3 finger touch is very likely still ASSEMBLING
+        // (on fast flicks, later fingers register up to ~170ms after the
+        // first). Settling it early shows the compositor a brief 2-3
+        // finger touch that then vanishes -- which poisons its gesture
+        // recognition for the real 4-finger touch that follows. Keep
+        // buffering instead; late fingers settle it as a gesture, the
+        // window running out settles it as what it is.
+        if (2..=3).contains(&count)
+            && self.touch_max <= 3
+            && elapsed < FAST_ASSEMBLY_WINDOW
+            && vel > FAST_ASSEMBLY_VEL_PADS_S
+        {
+            if !self.fast_hold {
+                self.fast_hold = true;
+                debug!(
+                    "fast {count}-finger touch ({vel:.2} pads/s): holding, \
+                    waiting for possible late fingers"
+                );
             }
-            self.fast3_hold = false;
+            return;
+        }
+        self.fast_hold = false;
+        if count == 3 && self.touch_max == 3 && self.touch_distinct <= 3 {
             self.pending.clear();
             let active = self.active_slots();
             self.commit_drag(&active, now, out);
             return;
         }
-        self.fast3_hold = false;
         self.settled = true;
         self.settle_live_touch(out);
     }

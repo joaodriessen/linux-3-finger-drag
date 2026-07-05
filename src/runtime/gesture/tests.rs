@@ -342,7 +342,9 @@ fn live_settle_introduces_fresh_touch_without_replaying_motion() {
     sim.frame(&down(0, 1, 100, 100));
     sim.frame_at(5, &mv(0, 300, 100)); // fast motion inside the probe window
     sim.frame_at(5, &mv(0, 500, 100));
-    let outs = sim.tick(10); // probe closes: touch settles live
+    // a fast lone finger is held to FAST1_WINDOW (40ms) in case more
+    // fingers are landing; tick past it -> settles live
+    let outs = sim.tick(35);
 
     let evs = synth_events(&outs);
     let xs: Vec<i32> = evs
@@ -1063,6 +1065,61 @@ fn calm_three_finger_drag_commits_at_entry_window() {
         synth_events(&outs).is_empty(),
         "committed drag: nothing reaches the compositor"
     );
+}
+
+/// THE STAGGERED FLICK (the real-hardware choreography): fingers land
+/// 0/25/60/120ms apart, all sweeping fast the whole time. NOTHING may
+/// reach the compositor until the touch stops assembling -- a brief
+/// 2-finger apparition that then vanishes poisons libinput's gesture
+/// engine for the 4-finger touch that follows (verified empirically
+/// against live KWin). When the 4th finger lands, the whole touch
+/// settles as one clean 4-finger intro.
+#[test]
+fn staggered_fast_flick_assembles_silently_into_one_gesture() {
+    let mut sim = Sim::with_scale(0.5);
+    let mut outs = sim.frame(&down(0, 1, 1000, 5800));
+    let mut y = 5800;
+    // fingers 2 and 3 land at ~24ms and ~64ms, everything moving fast
+    for step in 1..=14i32 {
+        y -= 150;
+        let mut evs = vec![];
+        if step == 3 {
+            evs.extend(down(1, 2, 1300, y));
+        }
+        if step == 8 {
+            evs.extend(down(2, 3, 1600, y));
+        }
+        evs.extend(mv(0, 1000, y));
+        if step > 3 {
+            evs.extend(mv(1, 1300, y));
+        }
+        if step > 8 {
+            evs.extend(mv(2, 1600, y));
+        }
+        outs = collect(outs, sim.frame_at(8, &evs));
+    }
+    // ~112ms in: 3 fast fingers, no 4th yet
+    assert_eq!(mouse_downs(&outs), 0, "no drag commit while assembling");
+    assert!(
+        synth_events(&outs).is_empty(),
+        "NOTHING may reach the compositor while a fast touch assembles: {:?}",
+        synth_events(&outs)
+    );
+
+    // the 4th finger lands at ~120ms: one clean 4-finger intro
+    let outs = sim.frame_at(8, &down(3, 4, 1900, y));
+    let evs = synth_events(&outs);
+    let ids: Vec<i32> = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID)
+        .map(|e| e.value)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "single clean 4-finger intro: {evs:?}"
+    );
+    assert_eq!(mouse_downs(&outs), 0);
 }
 
 // =========================================================================
