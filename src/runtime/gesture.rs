@@ -58,6 +58,15 @@ const AUX_UNSEEN: i32 = i32::MIN;
 /// device's ABS_MT_SLOT range at construction.
 pub const MAX_SLOTS: usize = 16;
 
+/// Velocity band for the 4+ finger "flick": at or below the low bound
+/// the configured four_finger_scale applies in full (calm, precise
+/// tracking); at or above the high bound motion passes UNSCALED so a
+/// fast flick keeps enough travel to push compositor gestures past
+/// their completion threshold instead of bouncing back -- the macOS
+/// momentum feel. Smoothstepped in between.
+const FLICK_LO_MM_S: f64 = 100.0;
+const FLICK_HI_MM_S: f64 = 350.0;
+
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
 /// written to uinput anyway).
@@ -196,6 +205,9 @@ impl Default for ScaleSlot {
 
 pub struct GestureMachine {
     timing: Timing,
+    /// Pad units per millimeter (from the device's X resolution), for
+    /// normalizing flick velocity across hardware.
+    units_per_mm: f64,
     slot_count: usize,
 
     slots: [Slot; MAX_SLOTS],
@@ -219,6 +231,11 @@ pub struct GestureMachine {
     /// True while the current settled touch is being relayed with
     /// four_finger_scale applied (state-diff relay instead of verbatim).
     scaled_touch: bool,
+    /// Smoothed finger velocity (mm/s) of the scaled touch, for the
+    /// flick ramp.
+    flick_velocity: f64,
+    /// When the previous scaled frame was processed (for velocity dt).
+    last_scaled_at: Option<Instant>,
     /// Per-slot scaling state: what the clone was last told (tracking id
     /// and position) plus the virtual (scaled) position accumulator and
     /// the last real position the delta was taken from.
@@ -250,9 +267,10 @@ pub struct GestureMachine {
 }
 
 impl GestureMachine {
-    pub fn new(timing: Timing, slot_count: usize) -> Self {
+    pub fn new(timing: Timing, units_per_mm: f64, slot_count: usize) -> Self {
         GestureMachine {
             timing,
+            units_per_mm: units_per_mm.max(1.0),
             slot_count: slot_count.clamp(1, MAX_SLOTS),
             slots: [Slot::default(); MAX_SLOTS],
             current_slot: 0,
@@ -265,6 +283,8 @@ impl GestureMachine {
             drag_px_total: (0, 0),
             drag_px_max_frame: 0,
             scaled_touch: false,
+            flick_velocity: 0.0,
+            last_scaled_at: None,
             scale_slots: [ScaleSlot::default(); MAX_SLOTS],
             real_keys: Vec::new(),
             clone_keys: Vec::new(),
@@ -574,8 +594,10 @@ impl GestureMachine {
             // Already-settled touch ending (most touches): this frame
             // carries the release events the compositor needs to see.
             if self.scaled_touch {
-                self.sync_scaled(out); // diff emits the releases + key zeros
+                self.sync_scaled(now, out); // diff emits the releases + key zeros
                 self.scaled_touch = false;
+                self.flick_velocity = 0.0;
+                self.last_scaled_at = None;
                 self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
             } else {
                 self.relay_frame(frame, out);
@@ -610,7 +632,7 @@ impl GestureMachine {
             }
             self.maybe_activate_scaling();
             if self.scaled_touch {
-                self.sync_scaled(out);
+                self.sync_scaled(now, out);
             } else {
                 self.relay_frame(frame, out);
             }
@@ -777,9 +799,11 @@ impl GestureMachine {
             }
         }
         self.scaled_touch = true;
+        self.flick_velocity = 0.0;
+        self.last_scaled_at = None;
         debug!(
-            "4+ finger touch: relaying with motion scale {}",
-            self.timing.four_finger_scale
+            "4+ finger touch: relaying with motion scale {} (flick ramp to 1.0 above {} mm/s)",
+            self.timing.four_finger_scale, FLICK_HI_MM_S
         );
     }
 
@@ -788,8 +812,40 @@ impl GestureMachine {
     /// finger's motion scaled around its touchdown anchor. Because the
     /// diff is computed against our authoritative slot model, slot
     /// context on the clone can never desync.
-    fn sync_scaled(&mut self, out: &mut Vec<Output>) {
-        let scale = self.timing.four_finger_scale;
+    fn sync_scaled(&mut self, now: Instant, out: &mut Vec<Output>) {
+        // Velocity-adaptive scale: mean per-frame finger travel,
+        // normalized to mm/s and smoothed, ramps the effective scale
+        // from four_finger_scale (slow, precise) up to 1.0 (a flick --
+        // full travel, so compositor gestures complete with momentum).
+        let dt_s = self
+            .last_scaled_at
+            .map(|t| now.duration_since(t).as_secs_f64().clamp(0.004, 0.1));
+        self.last_scaled_at = Some(now);
+        if let Some(dt_s) = dt_s {
+            // (the first frame after activation only seeds the clock --
+            // there is no baseline to take a velocity sample against)
+            let (mut travel, mut moving) = (0.0f64, 0u32);
+            for slot in 0..self.slot_count {
+                let real = self.slots[slot];
+                let ss = &self.scale_slots[slot];
+                if real.tracking_id >= 0 && ss.clone_id == real.tracking_id {
+                    let d = f64::from((real.x - ss.last_real.0).abs())
+                        .max(f64::from((real.y - ss.last_real.1).abs()));
+                    travel += d;
+                    moving += 1;
+                }
+            }
+            if moving > 0 {
+                let v = travel / f64::from(moving) / self.units_per_mm / dt_s;
+                self.flick_velocity = 0.5 * self.flick_velocity + 0.5 * v;
+            }
+        }
+        let t = ((self.flick_velocity - FLICK_LO_MM_S) / (FLICK_HI_MM_S - FLICK_LO_MM_S))
+            .clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t); // smoothstep
+        let base = self.timing.four_finger_scale;
+        let scale = base + (1.0 - base) * t;
+
         let mut frame = Vec::new();
         for slot in 0..self.slot_count {
             let real = self.slots[slot];

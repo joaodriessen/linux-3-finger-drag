@@ -29,13 +29,13 @@ impl Sim {
         let mut t = timing(0);
         t.four_finger_scale = scale;
         Sim {
-            m: GestureMachine::new(t, 16),
+            m: GestureMachine::new(t, 10.0, 16),
             now: Instant::now(),
         }
     }
     fn with_delay(drag_end_delay_ms: u64) -> Self {
         Sim {
-            m: GestureMachine::new(timing(drag_end_delay_ms), 16),
+            m: GestureMachine::new(timing(drag_end_delay_ms), 10.0, 16),
             now: Instant::now(),
         }
     }
@@ -635,19 +635,79 @@ fn four_finger_motion_is_scaled() {
         &down(3, 4, 1600, 700),
     ])); // settles instantly (4 fingers) -> intro at real positions
 
-    // move finger 0 by +200 units: the clone must see +100
-    let outs = sim.frame_at(10, &mv(0, 1200, 700));
+    // SLOW motion (well under the flick threshold): all four fingers
+    // move +200 units over 1s -> the clone must see +100 on each
+    let outs = sim.frame_at(
+        1000,
+        &cat(&[
+            &mv(0, 1200, 700),
+            &mv(1, 1400, 700),
+            &mv(2, 1600, 700),
+            &mv(3, 1800, 700),
+        ]),
+    );
     let evs = synth_events(&outs);
     assert!(
         evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1100)),
-        "motion must be scaled by 0.5 around the anchor: {evs:?}"
+        "slow motion must be scaled by 0.5 around the anchor: {evs:?}"
     );
-    // and accumulates: another +200 -> clone at anchor + 200
-    let outs = sim.frame_at(10, &mv(0, 1400, 700));
+    // and accumulates: another slow +200 -> finger 0 at anchor + 200
+    let outs = sim.frame_at(
+        1000,
+        &cat(&[
+            &mv(0, 1400, 700),
+            &mv(1, 1600, 700),
+            &mv(2, 1800, 700),
+            &mv(3, 2000, 700),
+        ]),
+    );
     let evs = synth_events(&outs);
     assert!(
         evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1200)),
         "scaled motion must accumulate: {evs:?}"
+    );
+}
+
+/// THE MOMENTUM FEEL: a fast flick must pass through (near) unscaled,
+/// so compositor gestures get enough travel to complete instead of
+/// bouncing back -- while slow motion stays at the configured scale.
+#[test]
+fn four_finger_flick_passes_at_full_scale() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 700),
+        &down(1, 2, 1200, 700),
+        &down(2, 3, 1400, 700),
+        &down(3, 4, 1600, 700),
+    ]));
+
+    // a flick: all four fingers sweep +240 units per 8ms frame
+    // (~3000 mm/s). Frame 1 seeds the velocity clock (still scaled);
+    // by frame 2 the ramp must be at full scale.
+    sim.frame_at(
+        8,
+        &cat(&[
+            &mv(0, 1240, 700),
+            &mv(1, 1440, 700),
+            &mv(2, 1640, 700),
+            &mv(3, 1840, 700),
+        ]),
+    );
+    let outs = sim.frame_at(
+        8,
+        &cat(&[
+            &mv(0, 1480, 700),
+            &mv(1, 1680, 700),
+            &mv(2, 1880, 700),
+            &mv(3, 2080, 700),
+        ]),
+    );
+    let evs = synth_events(&outs);
+    // frame 1 emitted anchor+120 (still 0.5-scaled); frame 2's +240 must
+    // pass through whole: 1120 + 240 = 1360
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1360)),
+        "flick-speed motion must pass unscaled by the 2nd frame: {evs:?}"
     );
 }
 
@@ -708,8 +768,17 @@ fn growth_to_four_activates_scaling_mid_touch() {
     sim.tick(50); // settles as a 2-finger touch, verbatim relay
     sim.frame_at(10, &cat(&[&down(2, 3, 1400, 700), &down(3, 4, 1600, 700)]));
 
-    // motion after growth: +200 real -> +100 on the clone
-    let outs = sim.frame_at(10, &mv(0, 1200, 700));
+    // slow motion after growth: all fingers +200 real over 1s ->
+    // finger 0 shows +100 on the clone
+    let outs = sim.frame_at(
+        1000,
+        &cat(&[
+            &mv(0, 1200, 700),
+            &mv(1, 1400, 700),
+            &mv(2, 1600, 700),
+            &mv(3, 1800, 700),
+        ]),
+    );
     let evs = synth_events(&outs);
     assert!(
         evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1100)),
@@ -959,7 +1028,7 @@ fn out_of_range_slot_clamps() {
 /// touches from snapshot entries beyond its real slot range.
 #[test]
 fn small_slot_count_has_no_phantom_slots() {
-    let mut m = GestureMachine::new(timing(0), 5);
+    let mut m = GestureMachine::new(timing(0), 10.0, 5);
     let now = Instant::now();
     // kernel snapshot buffers are MAX_SLOTS long; entries past the
     // device's 5 real slots arrive zeroed (tracking_id 0 looks "active")
@@ -968,7 +1037,7 @@ fn small_slot_count_has_no_phantom_slots() {
     // must at least never count slots 5-15
     m.on_resync(&snapshot[..5.min(snapshot.len())], now);
     assert_eq!(m.active_count(), 5);
-    let m2 = GestureMachine::new(timing(0), 5);
+    let m2 = GestureMachine::new(timing(0), 10.0, 5);
     assert_eq!(m2.slot_count, 5);
 }
 
