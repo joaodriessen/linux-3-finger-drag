@@ -203,7 +203,8 @@ fn run_scenario_scaled(seed: u64, drag_end_delay_ms: u64, four_finger_scale: f64
             press_grace: Duration::from_millis(75),
             four_finger_scale,
         },
-        10.0,
+        2000.0,
+        1400.0,
         16,
     );
     let mut shadow = ShadowClone::default();

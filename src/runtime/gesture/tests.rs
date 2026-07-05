@@ -29,13 +29,13 @@ impl Sim {
         let mut t = timing(0);
         t.four_finger_scale = scale;
         Sim {
-            m: GestureMachine::new(t, 10.0, 16),
+            m: GestureMachine::new(t, 2000.0, 1400.0, 16),
             now: Instant::now(),
         }
     }
     fn with_delay(drag_end_delay_ms: u64) -> Self {
         Sim {
-            m: GestureMachine::new(timing(drag_end_delay_ms), 10.0, 16),
+            m: GestureMachine::new(timing(drag_end_delay_ms), 2000.0, 1400.0, 16),
             now: Instant::now(),
         }
     }
@@ -635,8 +635,9 @@ fn four_finger_motion_is_scaled() {
         &down(3, 4, 1600, 700),
     ])); // settles instantly (4 fingers) -> intro at real positions
 
-    // SLOW motion (well under the flick threshold): all four fingers
-    // move +200 units over 1s -> the clone must see +100 on each
+    // SLOW motion (at the low edge of the flick band: 200 units per
+    // clamped-100ms dt = 1.0 pad-length/s on a 2000-unit axis): all four
+    // fingers move +200 units -> the clone must see +100 on each
     let outs = sim.frame_at(
         1000,
         &cat(&[
@@ -682,8 +683,9 @@ fn four_finger_flick_passes_at_full_scale() {
     ]));
 
     // a flick: all four fingers sweep +240 units per 8ms frame
-    // (~3000 mm/s). Frame 1 seeds the velocity clock (still scaled);
-    // by frame 2 the ramp must be at full scale.
+    // (= 15 pad-lengths/s, far past the flick band). Frame 1 seeds the
+    // velocity clock (still scaled); by frame 2 the ramp must be at
+    // full scale.
     sim.frame_at(
         8,
         &cat(&[
@@ -1028,7 +1030,7 @@ fn out_of_range_slot_clamps() {
 /// touches from snapshot entries beyond its real slot range.
 #[test]
 fn small_slot_count_has_no_phantom_slots() {
-    let mut m = GestureMachine::new(timing(0), 10.0, 5);
+    let mut m = GestureMachine::new(timing(0), 2000.0, 1400.0, 5);
     let now = Instant::now();
     // kernel snapshot buffers are MAX_SLOTS long; entries past the
     // device's 5 real slots arrive zeroed (tracking_id 0 looks "active")
@@ -1037,7 +1039,7 @@ fn small_slot_count_has_no_phantom_slots() {
     // must at least never count slots 5-15
     m.on_resync(&snapshot[..5.min(snapshot.len())], now);
     assert_eq!(m.active_count(), 5);
-    let m2 = GestureMachine::new(timing(0), 10.0, 5);
+    let m2 = GestureMachine::new(timing(0), 2000.0, 1400.0, 5);
     assert_eq!(m2.slot_count, 5);
 }
 

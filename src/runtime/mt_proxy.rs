@@ -99,7 +99,6 @@ pub struct MtProxy {
     synth: UInputHandle<File>,
     raw_fd: RawFd,
     slot_count: usize,
-    units_per_mm: f64,
     /// Axis ranges of the pad, for centering/wrapping the drag finger.
     x_range: (i32, i32),
     y_range: (i32, i32),
@@ -164,26 +163,12 @@ impl MtProxy {
             .absolute_info(AbsoluteAxis::MultitouchTouchMajor)
             .ok()
             .map(|i| i.minimum + (i.maximum - i.minimum) / 4);
-        // units/mm for the machine's flick-velocity normalization; pads
-        // that report no resolution get an estimate from the axis range
-        // against a typical ~100mm pad width
-        let units_per_mm = real
-            .absolute_info(AbsoluteAxis::MultitouchPositionX)
-            .map(|i| {
-                if i.resolution > 0 {
-                    f64::from(i.resolution)
-                } else {
-                    (f64::from(i.maximum) - f64::from(i.minimum)).max(1.0) / 100.0
-                }
-            })
-            .unwrap_or(1.0);
 
         Ok(MtProxy {
             real,
             synth,
             raw_fd,
             slot_count,
-            units_per_mm,
             x_range,
             y_range,
             synth_touch_major,
@@ -208,8 +193,11 @@ impl MtProxy {
     pub fn slot_count(&self) -> usize {
         self.slot_count
     }
-    pub fn units_per_mm(&self) -> f64 {
-        self.units_per_mm
+    pub fn x_extent(&self) -> f64 {
+        f64::from(self.x_range.1 - self.x_range.0)
+    }
+    pub fn y_extent(&self) -> f64 {
+        f64::from(self.y_range.1 - self.y_range.0)
     }
 
     /// Builds a synthetic uinput device with the same EV_KEY/EV_ABS/

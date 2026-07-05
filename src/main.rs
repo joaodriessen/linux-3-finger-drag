@@ -137,8 +137,12 @@ async fn run(args: &Args, mut cfg: config::Configuration) -> Result<(), io::Erro
 
         let mut proxy = MtProxy::new(&path)?;
         proxy.set_accel(cfg.acceleration);
-        let mut machine =
-            GestureMachine::new(cfg.timing(), proxy.units_per_mm(), proxy.slot_count());
+        let mut machine = GestureMachine::new(
+            cfg.timing(),
+            proxy.x_extent(),
+            proxy.y_extent(),
+            proxy.slot_count(),
+        );
         let watch = AsyncFd::with_interest(FdWatch(proxy.as_raw_fd()), Interest::READABLE)?;
 
         info!("linux-3-finger-drag started successfully!");

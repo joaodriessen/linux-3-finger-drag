@@ -58,14 +58,18 @@ const AUX_UNSEEN: i32 = i32::MIN;
 /// device's ABS_MT_SLOT range at construction.
 pub const MAX_SLOTS: usize = 16;
 
-/// Velocity band for the 4+ finger "flick": at or below the low bound
-/// the configured four_finger_scale applies in full (calm, precise
-/// tracking); at or above the high bound motion passes UNSCALED so a
-/// fast flick keeps enough travel to push compositor gestures past
-/// their completion threshold instead of bouncing back -- the macOS
-/// momentum feel. Smoothstepped in between.
-const FLICK_LO_MM_S: f64 = 100.0;
-const FLICK_HI_MM_S: f64 = 350.0;
+/// Velocity band for the 4+ finger "flick", in PAD-LENGTHS PER SECOND
+/// per axis: at or below the low bound the configured four_finger_scale
+/// applies in full (calm, precise tracking); at or above the high bound
+/// motion passes UNSCALED so a fast flick keeps enough travel to push
+/// compositor gestures past their completion threshold instead of
+/// bouncing back -- the macOS momentum feel. Smoothstepped in between.
+/// Normalizing per axis matters: pads are wider than tall and vertical
+/// flicks are biomechanically slower, so the same "fraction of the pad
+/// per second" is the fair bar for both directions (and it's
+/// resolution-independent across hardware).
+const FLICK_LO_PADS_S: f64 = 0.95;
+const FLICK_HI_PADS_S: f64 = 3.3;
 
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
@@ -205,9 +209,10 @@ impl Default for ScaleSlot {
 
 pub struct GestureMachine {
     timing: Timing,
-    /// Pad units per millimeter (from the device's X resolution), for
-    /// normalizing flick velocity across hardware.
-    units_per_mm: f64,
+    /// Axis extents in pad units, for normalizing flick velocity to
+    /// pad-lengths/s per axis.
+    x_extent: f64,
+    y_extent: f64,
     slot_count: usize,
 
     slots: [Slot; MAX_SLOTS],
@@ -267,10 +272,11 @@ pub struct GestureMachine {
 }
 
 impl GestureMachine {
-    pub fn new(timing: Timing, units_per_mm: f64, slot_count: usize) -> Self {
+    pub fn new(timing: Timing, x_extent: f64, y_extent: f64, slot_count: usize) -> Self {
         GestureMachine {
             timing,
-            units_per_mm: units_per_mm.max(1.0),
+            x_extent: x_extent.max(1.0),
+            y_extent: y_extent.max(1.0),
             slot_count: slot_count.clamp(1, MAX_SLOTS),
             slots: [Slot::default(); MAX_SLOTS],
             current_slot: 0,
@@ -802,8 +808,8 @@ impl GestureMachine {
         self.flick_velocity = 0.0;
         self.last_scaled_at = None;
         debug!(
-            "4+ finger touch: relaying with motion scale {} (flick ramp to 1.0 above {} mm/s)",
-            self.timing.four_finger_scale, FLICK_HI_MM_S
+            "4+ finger touch: relaying with motion scale {} (flick ramp to 1.0 above {} pad-lengths/s)",
+            self.timing.four_finger_scale, FLICK_HI_PADS_S
         );
     }
 
@@ -824,23 +830,24 @@ impl GestureMachine {
         if let Some(dt_s) = dt_s {
             // (the first frame after activation only seeds the clock --
             // there is no baseline to take a velocity sample against)
-            let (mut travel, mut moving) = (0.0f64, 0u32);
+            let (mut travel_x, mut travel_y, mut moving) = (0.0f64, 0.0f64, 0u32);
             for slot in 0..self.slot_count {
                 let real = self.slots[slot];
                 let ss = &self.scale_slots[slot];
                 if real.tracking_id >= 0 && ss.clone_id == real.tracking_id {
-                    let d = f64::from((real.x - ss.last_real.0).abs())
-                        .max(f64::from((real.y - ss.last_real.1).abs()));
-                    travel += d;
+                    travel_x += f64::from((real.x - ss.last_real.0).abs());
+                    travel_y += f64::from((real.y - ss.last_real.1).abs());
                     moving += 1;
                 }
             }
             if moving > 0 {
-                let v = travel / f64::from(moving) / self.units_per_mm / dt_s;
+                let vx = travel_x / f64::from(moving) / self.x_extent / dt_s;
+                let vy = travel_y / f64::from(moving) / self.y_extent / dt_s;
+                let v = vx.max(vy);
                 self.flick_velocity = 0.5 * self.flick_velocity + 0.5 * v;
             }
         }
-        let t = ((self.flick_velocity - FLICK_LO_MM_S) / (FLICK_HI_MM_S - FLICK_LO_MM_S))
+        let t = ((self.flick_velocity - FLICK_LO_PADS_S) / (FLICK_HI_PADS_S - FLICK_LO_PADS_S))
             .clamp(0.0, 1.0);
         let t = t * t * (3.0 - 2.0 * t); // smoothstep
         let base = self.timing.four_finger_scale;
