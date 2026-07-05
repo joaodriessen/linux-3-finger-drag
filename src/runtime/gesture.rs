@@ -77,6 +77,13 @@ const FLICK_HI_PADS_S: f64 = 1.8;
 /// including whatever was lost to recognition latency and late-landing
 /// fingers. Step cadence, per-step decay, minimum speed to keep
 /// gliding, and a hard time cap.
+/// A 3-finger touch moving faster than this during its entry window is
+/// held back from drag commitment (a fast 4-finger flick's 4th finger
+/// often registers 60-170ms late; measured drags start ~0.3 pads/s,
+/// flicks ~2.0). The hold lasts at most FAST3_WINDOW from touchdown.
+const FAST3_VEL_PADS_S: f64 = 0.45;
+const FAST3_WINDOW: Duration = Duration::from_millis(160);
+
 const GLIDE_STEP: Duration = Duration::from_millis(10);
 const GLIDE_DECAY: f64 = 0.82;
 const GLIDE_MIN_PADS_S: f64 = 0.15;
@@ -157,6 +164,10 @@ struct Slot {
     tracking_id: i32,
     x: i32,
     y: i32,
+    /// Touchdown position of the current contact (sentinel until the
+    /// first position report lands), for pre-recognition debt.
+    start_x: i32,
+    start_y: i32,
     /// Values of the auxiliary MT axes (MT_AUX_CODES order); AUX_UNSEEN
     /// until the device first reports one. touch_major (index 0) doubles
     /// as the thumb/palm diagnostic (thumbs are much larger than
@@ -180,6 +191,8 @@ impl Default for Slot {
             tracking_id: -1,
             x: 0,
             y: 0,
+            start_x: i32::MIN,
+            start_y: i32::MIN,
             aux: [AUX_UNSEEN; MT_AUX_CODES.len()],
         }
     }
@@ -291,6 +304,13 @@ pub struct GestureMachine {
     /// simultaneous undercounts them).
     touch_distinct: u32,
     touch_travel: (i64, i64),
+    /// A fast 3-finger touch being held back from drag commitment,
+    /// waiting for a possible late 4th finger.
+    fast3_hold: bool,
+    /// Mean per-finger displacement accumulated before the gesture was
+    /// recognized; paid out during the glide so the compositor receives
+    /// the full physical travel.
+    pending_debt: (f64, f64),
     settled: bool,
 
     /// Virtual left button state (survives across touches for drag-lock).
@@ -334,6 +354,8 @@ impl GestureMachine {
             touch_max: 0,
             touch_distinct: 0,
             touch_travel: (0, 0),
+            fast3_hold: false,
+            pending_debt: (0.0, 0.0),
             settled: false,
             held: false,
             lock_deadline: None,
@@ -371,7 +393,9 @@ impl GestureMachine {
         }
         if let Some(start) = self.touch_start {
             if !self.settled {
-                let window = if self.touch_max <= 1 {
+                let window = if self.fast3_hold {
+                    FAST3_WINDOW
+                } else if self.touch_max <= 1 {
                     self.timing.probe_delay
                 } else {
                     self.timing.entry_debounce
@@ -454,19 +478,27 @@ impl GestureMachine {
                 ABS_MT_TRACKING_ID => {
                     if ev.value >= 0 && self.slots[self.current_slot].tracking_id < 0 {
                         self.touch_distinct += 1;
+                        self.slots[self.current_slot].start_x = i32::MIN;
+                        self.slots[self.current_slot].start_y = i32::MIN;
                     }
                     self.slots[self.current_slot].tracking_id = ev.value;
                 }
                 ABS_MT_POSITION_X => {
                     let s = &mut self.slots[self.current_slot];
-                    if s.tracking_id >= 0 {
+                    if s.start_x == i32::MIN {
+                        // first report after touchdown: seed, don't count
+                        // the diff against the slot's stale old contents
+                        s.start_x = ev.value;
+                    } else if s.tracking_id >= 0 {
                         self.touch_travel.0 += i64::from((ev.value - s.x).abs());
                     }
                     s.x = ev.value;
                 }
                 ABS_MT_POSITION_Y => {
                     let s = &mut self.slots[self.current_slot];
-                    if s.tracking_id >= 0 {
+                    if s.start_y == i32::MIN {
+                        s.start_y = ev.value;
+                    } else if s.tracking_id >= 0 {
                         self.touch_travel.1 += i64::from((ev.value - s.y).abs());
                     }
                     s.y = ev.value;
@@ -494,6 +526,8 @@ impl GestureMachine {
                     tracking_id: id,
                     x,
                     y,
+                    start_x: x,
+                    start_y: y,
                     aux: [AUX_UNSEEN; MT_AUX_CODES.len()],
                 },
                 None => Slot::default(),
@@ -682,6 +716,7 @@ impl GestureMachine {
         if count == 0 {
             let had_pending = self.touch_start.is_some() && !self.settled;
             self.log_touch_autopsy(now, if had_pending { "tap" } else { "relayed" });
+            self.fast3_hold = false;
             self.touch_start = None;
             self.touch_max = 0;
             self.settled = false;
@@ -734,7 +769,7 @@ impl GestureMachine {
             // happens at the tail of every 4-finger swipe because
             // fingers never lift in unison -- from being hijacked into
             // a phantom drag + click.
-            if count == 3 && self.touch_max == 3 {
+            if count == 3 && self.touch_max == 3 && self.touch_distinct <= 3 {
                 self.commit_drag(&active, now, out);
                 return;
             }
@@ -749,7 +784,7 @@ impl GestureMachine {
 
         self.pending.extend_from_slice(frame);
 
-        if self.touch_max >= 4 {
+        if self.touch_max >= 4 || self.touch_distinct >= 4 {
             // Unambiguously bigger than a 3-finger drag could ever be --
             // no need to wait out the rest of the window.
             self.settled = true;
@@ -779,12 +814,36 @@ impl GestureMachine {
     /// touch held stably at exactly 3 fingers the whole time, otherwise
     /// release it to the compositor as an ordinary gesture.
     fn resolve_touch_decision(&mut self, count: usize, now: Instant, out: &mut Vec<Output>) {
-        if count == 3 && self.touch_max == 3 {
+        if count == 3 && self.touch_max == 3 && self.touch_distinct <= 3 {
+            let elapsed = self
+                .touch_start
+                .map(|t| now.duration_since(t))
+                .unwrap_or_default();
+            // A 3-finger touch already moving at flick speed is very
+            // likely a 4-finger flick whose last finger hasn't
+            // registered yet (measured: 60-170ms late on fast vertical
+            // flicks). Hold off drag commitment and keep buffering; a
+            // 4th contact settles it as a gesture, the window running
+            // out settles it as a (violent) drag.
+            let el_s = elapsed.as_secs_f64().max(0.001);
+            let vel = (self.touch_travel.0 as f64 / 3.0 / self.x_extent / el_s)
+                .max(self.touch_travel.1 as f64 / 3.0 / self.y_extent / el_s);
+            if elapsed < FAST3_WINDOW && vel > FAST3_VEL_PADS_S {
+                if !self.fast3_hold {
+                    self.fast3_hold = true;
+                    debug!(
+                        "fast 3-finger touch ({vel:.2} pads/s): holding drag commit,                         waiting for a possible late 4th finger"
+                    );
+                }
+                return;
+            }
+            self.fast3_hold = false;
             self.pending.clear();
             let active = self.active_slots();
             self.commit_drag(&active, now, out);
             return;
         }
+        self.fast3_hold = false;
         self.settled = true;
         self.settle_live_touch(out);
     }
@@ -910,9 +969,24 @@ impl GestureMachine {
         self.flick_velocity = 0.0;
         self.flick_latched = false;
         self.last_scaled_at = None;
+        // Pre-recognition debt: how far the fingers already travelled
+        // before the gesture was recognized (buffering, drag hold-off,
+        // late 4th finger). Paid out during the glide.
+        let (mut dx, mut dy, mut n) = (0.0f64, 0.0f64, 0u32);
+        for slot in 0..self.slot_count {
+            let sl = self.slots[slot];
+            if sl.tracking_id >= 0 && sl.start_x != i32::MIN && sl.start_y != i32::MIN {
+                dx += f64::from(sl.x - sl.start_x);
+                dy += f64::from(sl.y - sl.start_y);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.pending_debt = (dx / f64::from(n), dy / f64::from(n));
+        }
         debug!(
-            "4+ finger touch: relaying with motion scale {} (flick ramp to 1.0 above {} pad-lengths/s)",
-            self.timing.four_finger_scale, FLICK_HI_PADS_S
+            "4+ finger touch: relaying with motion scale {} (flick ramp above {} pad-lengths/s), debt=({:.0},{:.0}) units",
+            self.timing.four_finger_scale, FLICK_HI_PADS_S, self.pending_debt.0, self.pending_debt.1
         );
     }
 
@@ -1057,6 +1131,7 @@ impl GestureMachine {
         self.flick_velocity = 0.0;
         self.flick_latched = false;
         self.flick_dir = (0.0, 0.0);
+        self.pending_debt = (0.0, 0.0);
         self.last_scaled_at = None;
         self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
     }

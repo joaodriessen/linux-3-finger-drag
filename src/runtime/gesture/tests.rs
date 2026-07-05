@@ -965,6 +965,106 @@ fn new_touch_during_glide_ends_it_first() {
     assert_eq!(releases, 4, "the coasting fingers must release: {evs:?}");
 }
 
+/// THE LATE-4TH-FINGER ROOT FIX: a 3-finger touch already moving at
+/// flick speed is almost certainly a 4-finger flick whose last finger
+/// hasn't registered (measured 60-170ms late on fast vertical flicks).
+/// It must NOT be committed as a drag at the entry window -- the hold
+/// gives the 4th finger time to arrive, so the gesture starts as soon
+/// as hardware allows instead of detouring through drag+bailout.
+#[test]
+fn fast_three_finger_touch_waits_for_late_4th() {
+    let mut sim = Sim::with_scale(0.5);
+    // three fingers land and are ALREADY sweeping fast
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 1200),
+        &down(1, 2, 1300, 1200),
+        &down(2, 3, 1600, 1200),
+    ]));
+    for step in 1..=6i32 {
+        sim.frame_at(
+            8,
+            &cat(&[
+                &mv(0, 1000, 1200 - step * 120),
+                &mv(1, 1300, 1200 - step * 120),
+                &mv(2, 1600, 1200 - step * 120),
+            ]),
+        );
+    }
+    // past the 50ms entry window now (~48+ms), still 3 fingers, FAST:
+    let outs = sim.tick(10);
+    assert_eq!(
+        mouse_downs(&outs),
+        0,
+        "fast 3-finger touch must not commit as drag"
+    );
+    assert!(
+        synth_events(&outs).is_empty(),
+        "and must stay withheld while waiting for the 4th finger"
+    );
+
+    // the late 4th finger arrives ~90ms in: the touch settles as a
+    // GESTURE (intro to the compositor), never having been a drag
+    let outs = sim.frame_at(20, &down(3, 4, 1900, 800));
+    assert_eq!(mouse_downs(&outs), 0);
+    let evs = synth_events(&outs);
+    let ids: Vec<i32> = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID)
+        .map(|e| e.value)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "all four fingers introduced: {evs:?}"
+    );
+}
+
+/// ...but a fast 3-finger touch whose 4th never comes still becomes a
+/// drag when the hold window runs out (violent drags stay possible).
+#[test]
+fn fast_three_finger_touch_still_drags_after_the_hold() {
+    let mut sim = Sim::new();
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 1200),
+        &down(1, 2, 1300, 1200),
+        &down(2, 3, 1600, 1200),
+    ]));
+    for step in 1..=6i32 {
+        sim.frame_at(
+            8,
+            &cat(&[
+                &mv(0, 1000, 1200 - step * 120),
+                &mv(1, 1300, 1200 - step * 120),
+                &mv(2, 1600, 1200 - step * 120),
+            ]),
+        );
+    }
+    // ride out the hold window (160ms from touchdown), then move
+    let mut outs = sim.tick(120); // ~168ms: hold expires -> drag commits
+    outs = collect(outs, sim.frame_at(10, &mv(0, 1000, 300)));
+    assert_eq!(
+        mouse_downs(&outs),
+        1,
+        "the hold must not disable violent drags"
+    );
+}
+
+/// A calm 3-finger touch commits at the normal entry window -- the
+/// hold-off must not add latency to ordinary drags.
+#[test]
+fn calm_three_finger_drag_commits_at_entry_window() {
+    let mut sim = Sim::new();
+    let outs = commit_drag_only(&mut sim); // static fingers, 55ms
+    assert!(
+        sim.m.next_deadline().is_some(),
+        "press grace scheduled = committed"
+    );
+    assert!(
+        synth_events(&outs).is_empty(),
+        "committed drag: nothing reaches the compositor"
+    );
+}
+
 // =========================================================================
 // drag-lock (drag_end_delay > 0)
 // =========================================================================
