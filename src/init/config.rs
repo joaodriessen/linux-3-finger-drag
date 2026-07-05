@@ -103,6 +103,13 @@ pub struct Configuration {
     #[serde(default = "default_75ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub press_grace: Duration, // in milliseconds
+
+    // Motion scale for 4+ finger touches as relayed to the compositor.
+    // KWin's 4-finger gestures have no sensitivity setting of their own;
+    // lowering this slows them down without affecting cursor movement,
+    // scrolling, or 3-finger drags. 1.0 = passthrough (default).
+    #[serde(default = "default_1")]
+    pub four_finger_scale: f64,
 }
 
 impl Configuration {
@@ -115,6 +122,7 @@ impl Configuration {
             drag_end_delay: self.drag_end_delay,
             press_grace: self.press_grace,
             px_per_mm: PX_PER_MM * self.acceleration,
+            four_finger_scale: self.four_finger_scale,
         }
     }
 }
@@ -129,6 +137,7 @@ impl Default for Configuration {
             entry_debounce: Duration::from_millis(50),
             probe_delay: Duration::from_millis(15),
             press_grace: Duration::from_millis(75),
+            four_finger_scale: 1.0,
         }
     }
 }
@@ -268,6 +277,19 @@ impl Configuration {
                 "1000ms".into(),
             );
             self.press_grace = Duration::from_millis(1000);
+        }
+        if !self.four_finger_scale.is_finite() || !(0.05..=1.0).contains(&self.four_finger_scale) {
+            let clamped = if self.four_finger_scale.is_finite() {
+                self.four_finger_scale.clamp(0.05, 1.0)
+            } else {
+                1.0
+            };
+            fix(
+                "fourFingerScale",
+                format!("{}", self.four_finger_scale),
+                format!("{clamped}"),
+            );
+            self.four_finger_scale = clamped;
         }
         if self.drag_end_delay > Duration::from_millis(5000) {
             fix(

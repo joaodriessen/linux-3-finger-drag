@@ -116,6 +116,13 @@ pub struct Timing {
     pub press_grace: Duration,
     /// Combined px-per-mm * user acceleration factor.
     pub px_per_mm: f64,
+    /// Motion scale applied to touches of 4+ fingers as they are relayed
+    /// to the compositor (anchored at each finger's touchdown position).
+    /// Compositor gestures (KWin's 4-finger desktop-switch/overview) have
+    /// no sensitivity setting of their own; because the compositor only
+    /// sees what the proxy relays, this knob can slow them down without
+    /// affecting cursor (1 finger), scroll (2) or drags (3). 1.0 = off.
+    pub four_finger_scale: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +150,31 @@ impl Default for Slot {
 /// SYN_DROPPED (EVIOCGMTSLOTS). `(tracking_id, x, y)`.
 pub type SlotSnapshot = [(i32, i32, i32)];
 
+/// Per-slot bookkeeping for scaled (4+ finger) relay.
+#[derive(Clone, Copy)]
+struct ScaleSlot {
+    /// Tracking id the clone was last told for this slot (-1 = inactive).
+    clone_id: i32,
+    /// Position the clone was last told.
+    clone_pos: (i32, i32),
+    /// Virtual position accumulator (anchored at touchdown, moves by
+    /// real delta * scale).
+    virt: (f64, f64),
+    /// Real position the last delta was taken from.
+    last_real: (i32, i32),
+}
+
+impl Default for ScaleSlot {
+    fn default() -> Self {
+        ScaleSlot {
+            clone_id: -1,
+            clone_pos: (0, 0),
+            virt: (0.0, 0.0),
+            last_real: (0, 0),
+        }
+    }
+}
+
 pub struct GestureMachine {
     timing: Timing,
     x_res: f64,
@@ -168,6 +200,14 @@ pub struct GestureMachine {
     drag_commit_time: Option<Instant>,
     drag_px_total: (i64, i64),
     drag_px_max_frame: i32,
+
+    /// True while the current settled touch is being relayed with
+    /// four_finger_scale applied (state-diff relay instead of verbatim).
+    scaled_touch: bool,
+    /// Per-slot scaling state: what the clone was last told (tracking id
+    /// and position) plus the virtual (scaled) position accumulator and
+    /// the last real position the delta was taken from.
+    scale_slots: [ScaleSlot; MAX_SLOTS],
 
     /// Last EV_KEY values seen from the REAL device (BTN_TOUCH,
     /// BTN_TOOL_*...). The truth about tool state on the pad.
@@ -212,6 +252,8 @@ impl GestureMachine {
             drag_commit_time: None,
             drag_px_total: (0, 0),
             drag_px_max_frame: 0,
+            scaled_touch: false,
+            scale_slots: [ScaleSlot::default(); MAX_SLOTS],
             real_keys: Vec::new(),
             clone_keys: Vec::new(),
             pending: Vec::new(),
@@ -393,6 +435,13 @@ impl GestureMachine {
             }
         }
 
+        // A resync's corrections tell the clone REAL positions; if this
+        // touch was being relayed scaled, re-seed the anchors to match.
+        if self.scaled_touch {
+            self.scaled_touch = false;
+            self.maybe_activate_scaling();
+        }
+
         // The dropped events may have included liftoffs (even the whole
         // touch ending). Run the normal decision logic against the new
         // state with an empty frame so we can't be left suppressing (or
@@ -486,6 +535,7 @@ impl GestureMachine {
                 self.settled = true; // continues as an ordinary live touch
                 self.release_button(out);
                 self.intro_current_touch(out);
+                self.maybe_activate_scaling();
                 return;
             }
             self.drive_drag(&active, out);
@@ -508,7 +558,13 @@ impl GestureMachine {
             }
             // Already-settled touch ending (most touches): this frame
             // carries the release events the compositor needs to see.
-            self.relay_frame(frame, out);
+            if self.scaled_touch {
+                self.sync_scaled(out); // diff emits the releases + key zeros
+                self.scaled_touch = false;
+                self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
+            } else {
+                self.relay_frame(frame, out);
+            }
             return;
         }
 
@@ -537,7 +593,12 @@ impl GestureMachine {
                 self.commit_drag(&active, now, out);
                 return;
             }
-            self.relay_frame(frame, out);
+            self.maybe_activate_scaling();
+            if self.scaled_touch {
+                self.sync_scaled(out);
+            } else {
+                self.relay_frame(frame, out);
+            }
             return;
         }
 
@@ -671,6 +732,97 @@ impl GestureMachine {
         }
         self.pending.clear();
         self.intro_current_touch(out);
+        self.maybe_activate_scaling();
+    }
+
+    /// Activate scaled relay for the current settled touch if it
+    /// qualifies (4+ fingers, scale configured below 1.0). Seeds the
+    /// per-slot anchors from the CURRENT real state -- which is what the
+    /// clone was just told, whether by intro or by verbatim relay.
+    fn maybe_activate_scaling(&mut self) {
+        if self.scaled_touch || self.timing.four_finger_scale >= 1.0 || self.touch_max < 4 {
+            return;
+        }
+        for slot in 0..self.slot_count {
+            let real = self.slots[slot];
+            let ss = &mut self.scale_slots[slot];
+            // Seed only from what the clone has actually been told
+            // (relayed_active): in the growth case (2 -> 4 fingers)
+            // activation happens on the frame that ADDS fingers, before
+            // any relay -- those must stay unknown here so the first
+            // sync introduces them properly.
+            if real.tracking_id >= 0 && self.relayed_active[slot] {
+                ss.clone_id = real.tracking_id;
+                ss.clone_pos = (real.x, real.y);
+                ss.virt = (real.x as f64, real.y as f64);
+                ss.last_real = (real.x, real.y);
+            } else {
+                *ss = ScaleSlot::default();
+            }
+        }
+        self.scaled_touch = true;
+        debug!(
+            "4+ finger touch: relaying with motion scale {}",
+            self.timing.four_finger_scale
+        );
+    }
+
+    /// Scaled relay: instead of forwarding the raw frame, emit a state
+    /// DIFF between what the clone knows and the real pad, with each
+    /// finger's motion scaled around its touchdown anchor. Because the
+    /// diff is computed against our authoritative slot model, slot
+    /// context on the clone can never desync.
+    fn sync_scaled(&mut self, out: &mut Vec<Output>) {
+        let scale = self.timing.four_finger_scale;
+        let mut frame = Vec::new();
+        for slot in 0..self.slot_count {
+            let real = self.slots[slot];
+            let ss = &mut self.scale_slots[slot];
+            if real.tracking_id >= 0 {
+                if ss.clone_id != real.tracking_id {
+                    // finger landed (or id changed): anchor here
+                    ss.clone_id = real.tracking_id;
+                    ss.clone_pos = (real.x, real.y);
+                    ss.virt = (real.x as f64, real.y as f64);
+                    ss.last_real = (real.x, real.y);
+                    frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
+                    frame.push(Ev::abs(ABS_MT_TRACKING_ID, real.tracking_id));
+                    frame.push(Ev::abs(ABS_MT_POSITION_X, real.x));
+                    frame.push(Ev::abs(ABS_MT_POSITION_Y, real.y));
+                } else {
+                    ss.virt.0 += f64::from(real.x - ss.last_real.0) * scale;
+                    ss.virt.1 += f64::from(real.y - ss.last_real.1) * scale;
+                    ss.last_real = (real.x, real.y);
+                    let v = (ss.virt.0.round() as i32, ss.virt.1.round() as i32);
+                    if v != ss.clone_pos {
+                        frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
+                        if v.0 != ss.clone_pos.0 {
+                            frame.push(Ev::abs(ABS_MT_POSITION_X, v.0));
+                        }
+                        if v.1 != ss.clone_pos.1 {
+                            frame.push(Ev::abs(ABS_MT_POSITION_Y, v.1));
+                        }
+                        ss.clone_pos = v;
+                    }
+                }
+            } else if ss.clone_id >= 0 {
+                *ss = ScaleSlot::default();
+                frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
+                frame.push(Ev::abs(ABS_MT_TRACKING_ID, -1));
+            }
+        }
+        for i in 0..self.real_keys.len() {
+            let (code, value) = self.real_keys[i];
+            if Self::key_value(&self.clone_keys, code) != value {
+                frame.push(Ev::new(EV_KEY, code, value));
+                Self::note_key(&mut self.clone_keys, code, value);
+            }
+        }
+        self.mark_relayed();
+        if !frame.is_empty() {
+            frame.push(Ev::syn());
+            out.push(Output::EmitSynth(frame));
+        }
     }
 
     fn relay_frame(&mut self, frame: &[Ev], out: &mut Vec<Output>) {

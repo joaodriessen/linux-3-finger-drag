@@ -189,6 +189,10 @@ impl Hand {
 }
 
 fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
+    run_scenario_scaled(seed, drag_end_delay_ms, 1.0);
+}
+
+fn run_scenario_scaled(seed: u64, drag_end_delay_ms: u64, four_finger_scale: f64) {
     let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     let mut m = GestureMachine::new(
         Timing {
@@ -197,6 +201,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
             drag_end_delay: Duration::from_millis(drag_end_delay_ms),
             press_grace: Duration::from_millis(75),
             px_per_mm: PX_PER_MM,
+            four_finger_scale,
         },
         10.0,
         10.0,
@@ -348,5 +353,6 @@ fn randomized_stress_invariants() {
     for seed in 0..48u64 {
         run_scenario(seed, 0);
         run_scenario(seed, 300);
+        run_scenario_scaled(seed, 0, 0.5);
     }
 }

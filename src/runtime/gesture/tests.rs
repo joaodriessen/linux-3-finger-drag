@@ -14,6 +14,7 @@ fn timing(drag_end_delay_ms: u64) -> Timing {
         drag_end_delay: Duration::from_millis(drag_end_delay_ms),
         press_grace: Duration::from_millis(75),
         px_per_mm: PX_PER_MM,
+        four_finger_scale: 1.0,
     }
 }
 
@@ -26,6 +27,14 @@ struct Sim {
 impl Sim {
     fn new() -> Self {
         Self::with_delay(0)
+    }
+    fn with_scale(scale: f64) -> Self {
+        let mut t = timing(0);
+        t.four_finger_scale = scale;
+        Sim {
+            m: GestureMachine::new(t, RES, RES, 16),
+            now: Instant::now(),
+        }
     }
     fn with_delay(drag_end_delay_ms: u64) -> Self {
         Sim {
@@ -616,6 +625,105 @@ fn no_drag_smearing_after_drag_with_zero_delay() {
     outs = collect(outs, sim.frame_at(5, &mv(0, 200, 100)));
     assert_eq!(mouse_downs(&outs), 0);
     assert_eq!(mouse_ups(&outs), 0, "button state must not change again");
+}
+
+// =========================================================================
+// four-finger motion scaling
+// =========================================================================
+
+/// With fourFingerScale set, a 4-finger touch's motion reaches the
+/// compositor scaled around each finger's touchdown anchor -- KWin's
+/// gesture progress slows down accordingly.
+#[test]
+fn four_finger_motion_is_scaled() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 700),
+        &down(1, 2, 1200, 700),
+        &down(2, 3, 1400, 700),
+        &down(3, 4, 1600, 700),
+    ])); // settles instantly (4 fingers) -> intro at real positions
+
+    // move finger 0 by +200 units: the clone must see +100
+    let outs = sim.frame_at(10, &mv(0, 1200, 700));
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1100)),
+        "motion must be scaled by 0.5 around the anchor: {evs:?}"
+    );
+    // and accumulates: another +200 -> clone at anchor + 200
+    let outs = sim.frame_at(10, &mv(0, 1400, 700));
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1200)),
+        "scaled motion must accumulate: {evs:?}"
+    );
+}
+
+/// Liftoff of a scaled touch must release every slot on the clone
+/// (and the tool bits), leaving no phantom state.
+#[test]
+fn scaled_touch_releases_cleanly() {
+    const BTN_TOUCH: u16 = 0x14a;
+    let mut sim = Sim::with_scale(0.5);
+    let mut f = cat(&[
+        &down(0, 1, 1000, 700),
+        &down(1, 2, 1200, 700),
+        &down(2, 3, 1400, 700),
+        &down(3, 4, 1600, 700),
+    ]);
+    f.push(Ev::new(EV_KEY, BTN_TOUCH, 1));
+    sim.frame(&f);
+    sim.frame_at(10, &mv(0, 1300, 700));
+
+    let mut lift = cat(&[&up(0), &up(1), &up(2), &up(3)]);
+    lift.push(Ev::new(EV_KEY, BTN_TOUCH, 0));
+    let outs = sim.frame_at(10, &lift);
+    let evs = synth_events(&outs);
+    let releases = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID && e.value == -1)
+        .count();
+    assert_eq!(
+        releases, 4,
+        "all four slots must release on the clone: {evs:?}"
+    );
+    assert!(
+        evs.contains(&Ev::new(EV_KEY, BTN_TOUCH, 0)),
+        "tool state must clear too: {evs:?}"
+    );
+}
+
+/// 1- and 2-finger touches are NEVER scaled, whatever the config says.
+#[test]
+fn cursor_and_scroll_touches_are_never_scaled() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&down(0, 1, 1000, 700));
+    sim.tick(15); // settles live
+    let outs = sim.frame_at(10, &mv(0, 1200, 700));
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1200)),
+        "single-finger motion must relay verbatim: {evs:?}"
+    );
+}
+
+/// A touch that grows from 2 to 4 fingers mid-relay starts scaling from
+/// the moment it becomes a 4-finger touch (anchored at current state).
+#[test]
+fn growth_to_four_activates_scaling_mid_touch() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&cat(&[&down(0, 1, 1000, 700), &down(1, 2, 1200, 700)]));
+    sim.tick(50); // settles as a 2-finger touch, verbatim relay
+    sim.frame_at(10, &cat(&[&down(2, 3, 1400, 700), &down(3, 4, 1600, 700)]));
+
+    // motion after growth: +200 real -> +100 on the clone
+    let outs = sim.frame_at(10, &mv(0, 1200, 700));
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1100)),
+        "post-growth motion must be scaled from the growth anchor: {evs:?}"
+    );
 }
 
 // =========================================================================
