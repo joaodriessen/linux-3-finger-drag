@@ -92,9 +92,23 @@ const FAST_ASSEMBLY_WINDOW: Duration = Duration::from_millis(160);
 const FAST1_WINDOW: Duration = Duration::from_millis(40);
 
 const GLIDE_STEP: Duration = Duration::from_millis(10);
-const GLIDE_DECAY: f64 = 0.82;
+const GLIDE_DECAY: f64 = 0.86;
 const GLIDE_MIN_PADS_S: f64 = 0.15;
-const GLIDE_MAX: Duration = Duration::from_millis(240);
+const GLIDE_MAX: Duration = Duration::from_millis(300);
+
+/// A latched flick is unambiguous intent: deliver MORE than the
+/// physical travel so compositor gestures complete decisively instead
+/// of hovering at their threshold (empirically 1.0x completed KWin's
+/// overview only ~2 times in 3). Overshoot is invisible -- the gesture
+/// completes and clamps.
+const FLICK_BOOST: f64 = 1.35;
+/// The first frames after a touch's intro are speed-capped: fingers
+/// "born" already moving at flick speed can be flagged by libinput's
+/// speed-based palm/thumb filters (dropping the effective finger count
+/// below the gesture's). The withheld distance is repaid via the debt
+/// machinery. Cap ~= 2.2mm/frame on a 94 units/mm pad.
+const EASE_IN_FRAMES: u32 = 3;
+const EASE_IN_MAX_UNITS: f64 = 210.0;
 
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
@@ -278,6 +292,8 @@ pub struct GestureMachine {
     /// Signed smoothed gesture velocity (units/s per axis), the glide's
     /// launch vector.
     flick_dir: (f64, f64),
+    /// Frames emitted since the touch's intro (for the ease-in cap).
+    frames_since_intro: u32,
     /// Liftoff glide state: the clone's fingers are coasting.
     glide_active: bool,
     glide_v: (f64, f64),
@@ -348,6 +364,7 @@ impl GestureMachine {
             flick_velocity: 0.0,
             flick_latched: false,
             flick_dir: (0.0, 0.0),
+            frames_since_intro: 0,
             glide_active: false,
             glide_v: (0.0, 0.0),
             glide_next: None,
@@ -467,7 +484,7 @@ impl GestureMachine {
             }
             self.fast_hold = false;
             self.settled = true;
-            self.settle_live_touch(&mut out);
+            self.settle_live_touch(now, &mut out);
             return out;
         }
         if now >= start + self.timing.entry_debounce {
@@ -599,7 +616,7 @@ impl GestureMachine {
         // touch was being relayed scaled, re-seed the anchors to match.
         if self.scaled_touch {
             self.scaled_touch = false;
-            self.maybe_activate_scaling();
+            self.maybe_activate_scaling(now);
         }
 
         // The dropped events may have included liftoffs (even the whole
@@ -724,7 +741,7 @@ impl GestureMachine {
                 self.settled = true; // continues as an ordinary live touch
                 self.release_button(out);
                 self.intro_current_touch(out);
-                self.maybe_activate_scaling();
+                self.maybe_activate_scaling(now);
                 return;
             }
             self.drive_drag(&active, out);
@@ -792,7 +809,7 @@ impl GestureMachine {
                 self.commit_drag(&active, now, out);
                 return;
             }
-            self.maybe_activate_scaling();
+            self.maybe_activate_scaling(now);
             if self.scaled_touch {
                 self.sync_scaled(now, out);
             } else {
@@ -807,7 +824,7 @@ impl GestureMachine {
             // Unambiguously bigger than a 3-finger drag could ever be --
             // no need to wait out the rest of the window.
             self.settled = true;
-            self.settle_live_touch(out);
+            self.settle_live_touch(now, out);
             return;
         }
 
@@ -831,7 +848,7 @@ impl GestureMachine {
             }
             self.fast_hold = false;
             self.settled = true;
-            self.settle_live_touch(out);
+            self.settle_live_touch(now, out);
             return;
         }
 
@@ -881,7 +898,7 @@ impl GestureMachine {
             return;
         }
         self.settled = true;
-        self.settle_live_touch(out);
+        self.settle_live_touch(now, out);
     }
 
     /// Commit the current touch as a 3-finger drag. The button press is
@@ -966,21 +983,24 @@ impl GestureMachine {
     /// leap at onset. A quick tap that already ENDED still uses
     /// flush_pending: its verbatim replay is what keeps tap gestures
     /// working, and taps carry no meaningful motion to burst.
-    fn settle_live_touch(&mut self, out: &mut Vec<Output>) {
+    fn settle_live_touch(&mut self, now: Instant, out: &mut Vec<Output>) {
         if self.lock_deadline.take().is_some() {
             self.release_button(out);
         }
         self.pending.clear();
         self.intro_current_touch(out);
-        self.maybe_activate_scaling();
+        self.maybe_activate_scaling(now);
     }
 
     /// Activate scaled relay for the current settled touch if it
     /// qualifies (4+ fingers, scale configured below 1.0). Seeds the
     /// per-slot anchors from the CURRENT real state -- which is what the
     /// clone was just told, whether by intro or by verbatim relay.
-    fn maybe_activate_scaling(&mut self) {
-        if self.scaled_touch || self.timing.four_finger_scale >= 1.0 || self.touch_max < 4 {
+    fn maybe_activate_scaling(&mut self, now: Instant) {
+        if self.scaled_touch
+            || self.timing.four_finger_scale >= 1.0
+            || (self.touch_max < 4 && self.touch_distinct < 4)
+        {
             return;
         }
         for slot in 0..self.slot_count {
@@ -1002,12 +1022,11 @@ impl GestureMachine {
             }
         }
         self.scaled_touch = true;
-        self.flick_velocity = 0.0;
-        self.flick_latched = false;
         self.last_scaled_at = None;
+        self.frames_since_intro = 0;
         // Pre-recognition debt: how far the fingers already travelled
-        // before the gesture was recognized (buffering, drag hold-off,
-        // late 4th finger). Paid out during the glide.
+        // before the gesture was recognized (silent assembly, late
+        // fingers). Paid out during relay and the glide.
         let (mut dx, mut dy, mut n) = (0.0f64, 0.0f64, 0u32);
         for slot in 0..self.slot_count {
             let sl = self.slots[slot];
@@ -1020,9 +1039,28 @@ impl GestureMachine {
         if n > 0 {
             self.pending_debt = (dx / f64::from(n), dy / f64::from(n));
         }
+        // Seed the flick estimate from the ASSEMBLY-phase velocity: with
+        // silent assembly the flick's fastest motion happens before the
+        // intro, and measuring only the post-intro tail would starve the
+        // latch (no latch -> no glide -> the debt never paid).
+        let elapsed = self
+            .touch_start
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0)
+            .max(0.001);
+        let fingers = f64::from(n.max(1));
+        let pre_vel = (self.touch_travel.0 as f64 / fingers / self.x_extent / elapsed)
+            .max(self.touch_travel.1 as f64 / fingers / self.y_extent / elapsed);
+        self.flick_velocity = pre_vel;
+        self.flick_dir = (self.pending_debt.0 / elapsed, self.pending_debt.1 / elapsed);
+        self.flick_latched = pre_vel >= (FLICK_LO_PADS_S + FLICK_HI_PADS_S) / 2.0;
         debug!(
-            "4+ finger touch: relaying with motion scale {} (flick ramp above {} pad-lengths/s), debt=({:.0},{:.0}) units",
-            self.timing.four_finger_scale, FLICK_HI_PADS_S, self.pending_debt.0, self.pending_debt.1
+            "4+ finger touch: relaying with motion scale {} (assembly vel {:.2} pads/s, latched={}), debt=({:.0},{:.0}) units",
+            self.timing.four_finger_scale,
+            pre_vel,
+            self.flick_latched,
+            self.pending_debt.0,
+            self.pending_debt.1
         );
     }
 
@@ -1090,12 +1128,32 @@ impl GestureMachine {
             }
         }
         let scale = if self.flick_latched {
-            1.0
+            FLICK_BOOST
         } else {
             let t = t * t * (3.0 - 2.0 * t); // smoothstep
             let base = self.timing.four_finger_scale;
             base + (1.0 - base) * t
         };
+
+        // Ease-in: cap the first post-intro frames to plausible finger
+        // speed (libinput speed-filters touches born moving too fast);
+        // the withheld distance flows back through the debt.
+        self.frames_since_intro = self.frames_since_intro.saturating_add(1);
+        let easing = self.frames_since_intro <= EASE_IN_FRAMES;
+
+        // Pay out pre-recognition debt during live relay as well (the
+        // glide handles whatever remains at liftoff) -- otherwise a
+        // touch that never latches would silently discard its whole
+        // assembly-phase travel.
+        let (pay_x, pay_y) =
+            if !easing && (self.flick_latched || scale > self.timing.four_finger_scale) {
+                let p = (self.pending_debt.0 * 0.3, self.pending_debt.1 * 0.3);
+                self.pending_debt.0 -= p.0;
+                self.pending_debt.1 -= p.1;
+                p
+            } else {
+                (0.0, 0.0)
+            };
 
         let mut frame = Vec::new();
         for slot in 0..self.slot_count {
@@ -1119,8 +1177,20 @@ impl GestureMachine {
                         }
                     }
                 } else {
-                    ss.virt.0 += f64::from(real.x - ss.last_real.0) * scale;
-                    ss.virt.1 += f64::from(real.y - ss.last_real.1) * scale;
+                    let mut step_x = f64::from(real.x - ss.last_real.0) * scale + pay_x;
+                    let mut step_y = f64::from(real.y - ss.last_real.1) * scale + pay_y;
+                    if easing {
+                        // withhold the excess into the debt so no travel
+                        // is lost, just delivered a few frames later
+                        let capped_x = step_x.clamp(-EASE_IN_MAX_UNITS, EASE_IN_MAX_UNITS);
+                        let capped_y = step_y.clamp(-EASE_IN_MAX_UNITS, EASE_IN_MAX_UNITS);
+                        self.pending_debt.0 += step_x - capped_x;
+                        self.pending_debt.1 += step_y - capped_y;
+                        step_x = capped_x;
+                        step_y = capped_y;
+                    }
+                    ss.virt.0 += step_x;
+                    ss.virt.1 += step_y;
                     ss.last_real = (real.x, real.y);
                     let v = (ss.virt.0.round() as i32, ss.virt.1.round() as i32);
                     let aux_changed = (0..MT_AUX_CODES.len())

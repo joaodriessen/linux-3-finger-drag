@@ -709,11 +709,17 @@ fn four_finger_flick_passes_at_full_scale() {
     let evs = synth_events(&outs);
     // frame 1 emitted anchor+120 (still 0.5-scaled). Frame 2 latches the
     // flick AND catches up the withheld travel: the virtual finger snaps
-    // to the real one, so the clone sees the full physical position
-    // (anchor + 240 + 240 = 1480), not just the unscaled tail.
+    // to the real one and the boosted delta lands on top -- the clone
+    // must reach AT LEAST the full physical position (anchor+240+240).
+    let max_x = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_POSITION_X)
+        .map(|e| e.value)
+        .max()
+        .unwrap_or(0);
     assert!(
-        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1480)),
-        "a latched flick must deliver its full physical travel: {evs:?}"
+        max_x >= 1480,
+        "a latched flick must deliver at least its physical travel: {evs:?}"
     );
 
     // THE LATCH: fingers decelerate before liftoff; the deceleration
@@ -729,10 +735,16 @@ fn four_finger_flick_passes_at_full_scale() {
         ]),
     );
     let evs = synth_events(&outs);
-    // latched + caught-up: the virtual finger now tracks the real one
+    // latched: the deceleration tail passes at (at least) full scale
+    let max_x = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_POSITION_X)
+        .map(|e| e.value)
+        .max()
+        .unwrap_or(0);
     assert!(
-        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1680)),
-        "post-flick deceleration must stay unscaled (latched): {evs:?}"
+        max_x >= 1680,
+        "post-flick deceleration must stay >= unscaled (latched): {evs:?}"
     );
 }
 
@@ -1120,6 +1132,47 @@ fn staggered_fast_flick_assembles_silently_into_one_gesture() {
         "single clean 4-finger intro: {evs:?}"
     );
     assert_eq!(mouse_downs(&outs), 0);
+}
+
+/// LATCH SEEDING: with silent assembly, a flick's fastest motion
+/// happens BEFORE the intro. The flick estimate must be seeded from the
+/// assembly-phase velocity so a real flick arrives at its intro already
+/// latched -- measuring only the post-intro tail starves the latch (no
+/// latch -> no glide -> the assembly travel silently discarded), which
+/// killed slower horizontal desktop-switch flicks.
+#[test]
+fn assembly_velocity_seeds_the_latch() {
+    let mut sim = Sim::with_scale(0.3);
+    // staggered fast assembly, as in the staggered test
+    let mut y = 5800;
+    sim.frame(&down(0, 1, 1000, y));
+    for step in 1..=14i32 {
+        y -= 150;
+        let mut evs = vec![];
+        if step == 3 {
+            evs.extend(down(1, 2, 1300, y));
+        }
+        if step == 8 {
+            evs.extend(down(2, 3, 1600, y));
+        }
+        evs.extend(mv(0, 1000, y));
+        if step > 3 {
+            evs.extend(mv(1, 1300, y));
+        }
+        if step > 8 {
+            evs.extend(mv(2, 1600, y));
+        }
+        sim.frame_at(8, &evs);
+    }
+    sim.frame_at(8, &down(3, 4, 1900, y)); // 4th finger: settles + intro
+
+    // liftoff right away: a seeded latch means the glide MUST start
+    // (which is also where the remaining assembly debt gets paid)
+    sim.frame_at(8, &cat(&[&up(0), &up(1), &up(2), &up(3)]));
+    assert!(
+        sim.m.is_gliding(),
+        "assembly-phase velocity must seed the latch so the flick glides"
+    );
 }
 
 // =========================================================================
