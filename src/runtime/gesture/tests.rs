@@ -5,15 +5,12 @@
 
 use super::*;
 
-const RES: f64 = 10.0; // units per mm -> 1 unit = 0.1mm = 1.2px at PX_PER_MM=12
-
 fn timing(drag_end_delay_ms: u64) -> Timing {
     Timing {
         probe_delay: Duration::from_millis(15),
         entry_debounce: Duration::from_millis(50),
         drag_end_delay: Duration::from_millis(drag_end_delay_ms),
         press_grace: Duration::from_millis(75),
-        px_per_mm: PX_PER_MM,
         four_finger_scale: 1.0,
     }
 }
@@ -32,13 +29,13 @@ impl Sim {
         let mut t = timing(0);
         t.four_finger_scale = scale;
         Sim {
-            m: GestureMachine::new(t, RES, RES, 16),
+            m: GestureMachine::new(t, 16),
             now: Instant::now(),
         }
     }
     fn with_delay(drag_end_delay_ms: u64) -> Self {
         Sim {
-            m: GestureMachine::new(timing(drag_end_delay_ms), RES, RES, 16),
+            m: GestureMachine::new(timing(drag_end_delay_ms), 16),
             now: Instant::now(),
         }
     }
@@ -520,31 +517,25 @@ fn stationary_hold_lifting_before_grace_still_clicks() {
 // drag behavior
 // =========================================================================
 
-/// Motion of the reference finger drives the virtual mouse, scaled by
-/// resolution and px_per_mm, with sub-pixel remainders carried (not
-/// discarded) so slow drags don't lose motion.
+/// Drag motion is the reference finger's RAW delta in pad units,
+/// lossless -- the I/O shell replays it onto the clone's synthetic
+/// finger, so libinput applies the same touchpad acceleration as
+/// ordinary cursor movement (identical feel by construction).
 #[test]
-fn drag_motion_scales_and_carries_subpixels() {
+fn drag_motion_emits_raw_reference_deltas() {
     let mut sim = Sim::new();
     start_drag(&mut sim);
 
-    // 10 units = 1mm = 12px exactly
     let outs = sim.frame_at(10, &mv(0, 510, 500));
-    assert_eq!(total_move(&outs), (12, 0));
+    assert_eq!(total_move(&outs), (10, 0), "raw units, no scaling");
 
-    // five frames of 0.3px each (0.25 units): trunc-only would emit 0
-    // forever; the carry must accumulate to exactly 1px total (0.3*5)
+    // single-unit motion is never lost
     let mut acc = Vec::new();
     for i in 1..=5 {
-        // 0.25 units per frame is below integer resolution; simulate by
-        // moving 1 unit every 4th frame is NOT the same thing -- so use
-        // y axis: 1 unit = 0.1mm = 1.2px... instead go smaller: 0.4px =
-        // not representable. Use repeated 1-unit moves: 1.2px -> 1px + 0.2 carry
         acc = collect(acc, sim.frame_at(8, &mv(0, 510 + i, 500)));
     }
-    // 5 units = 0.5mm = 6.0px total; trunc-per-frame would give 5px
     let (dx, _) = total_move(&acc);
-    assert_eq!(dx, 6, "sub-pixel carry must not lose motion (got {dx})");
+    assert_eq!(dx, 5, "unit-by-unit motion must be lossless (got {dx})");
 }
 
 /// Once dragging, a partial liftoff (3 -> 2 -> 1) continues the drag
@@ -565,13 +556,13 @@ fn drag_partial_liftoff_continues_and_never_leaks() {
     );
 
     outs = sim.frame_at(10, &up(0)); // 2 -> 1: re-baselines onto slot 2 (700,500)
-    outs = collect(outs, sim.frame_at(10, &mv(2, 710, 500))); // +10 units = 12px
-    outs = collect(outs, sim.frame_at(10, &mv(2, 720, 500))); // +10 units = 12px
+    outs = collect(outs, sim.frame_at(10, &mv(2, 710, 500))); // +10 units
+    outs = collect(outs, sim.frame_at(10, &mv(2, 720, 500))); // +10 units
     let (dx, _) = total_move(&outs);
-    // 24px total proves a clean handoff: a stale baseline from slot 0's
-    // position (500) would have produced a 210-unit = 252px jump instead
+    // 20 units total proves a clean handoff: a stale baseline from slot
+    // 0's position (500) would have produced a 210-unit jump instead
     assert_eq!(
-        dx, 24,
+        dx, 20,
         "after reference handoff, motion resumes from new baseline"
     );
 
@@ -904,7 +895,7 @@ fn resync_during_drag_rebaselines_without_jump() {
 
     // next real motion moves normally from the new (900,900) baseline
     let outs = sim.frame_at(10, &mv(0, 910, 910));
-    assert_eq!(total_move(&outs), (12, 12));
+    assert_eq!(total_move(&outs), (10, 10));
 }
 
 /// Resync revealing the whole touch ended during the drop while
@@ -968,7 +959,7 @@ fn out_of_range_slot_clamps() {
 /// touches from snapshot entries beyond its real slot range.
 #[test]
 fn small_slot_count_has_no_phantom_slots() {
-    let mut m = GestureMachine::new(timing(0), RES, RES, 5);
+    let mut m = GestureMachine::new(timing(0), 5);
     let now = Instant::now();
     // kernel snapshot buffers are MAX_SLOTS long; entries past the
     // device's 5 real slots arrive zeroed (tracking_id 0 looks "active")
@@ -977,7 +968,7 @@ fn small_slot_count_has_no_phantom_slots() {
     // must at least never count slots 5-15
     m.on_resync(&snapshot[..5.min(snapshot.len())], now);
     assert_eq!(m.active_count(), 5);
-    let m2 = GestureMachine::new(timing(0), RES, RES, 5);
+    let m2 = GestureMachine::new(timing(0), 5);
     assert_eq!(m2.slot_count, 5);
 }
 

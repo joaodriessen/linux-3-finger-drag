@@ -27,9 +27,35 @@ use tracing::{debug, info, warn};
 use input_linux::{sys, AbsoluteAxis, AbsoluteInfoSetup, EvdevHandle, EventKind, UInputHandle};
 
 use super::gesture::{Ev, GestureMachine, Output, EV_SYN, MAX_SLOTS, SYN_DROPPED, SYN_REPORT};
-use super::virtual_trackpad::VirtualTrackpad;
 
 const READ_BATCH: usize = 64;
+
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+const BTN_LEFT: u16 = 0x110;
+const BTN_TOUCH: u16 = 0x14a;
+const BTN_TOOL_FINGER: u16 = 0x145;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
+const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
+
+/// The synthetic finger that carries out 3-finger drags ON THE CLONE:
+/// one touch with BTN_LEFT held (the clone is a clickpad, so libinput
+/// reads button + moving finger as a drag). Because this motion goes
+/// through the same libinput touchpad pipeline as ordinary cursor
+/// movement -- same device, same acceleration curve, same speed
+/// setting -- drags and the cursor feel identical by construction.
+/// (This replaced a separate virtual REL-mouse device, whose different
+/// libinput acceleration curve could never be made to match.)
+struct DragFinger {
+    active: bool,
+    /// Sub-unit position accumulator (acceleration multiplier applied).
+    pos: (f64, f64),
+    emitted: (i32, i32),
+    next_id: i32,
+}
 
 /// The `phys` marker stamped on our synthetic clone so device discovery
 /// can never mistake our own clone for a real touchpad (it impersonates
@@ -72,9 +98,17 @@ pub struct MtProxy {
     real: EvdevHandle<File>,
     synth: UInputHandle<File>,
     raw_fd: RawFd,
-    x_res: f64,
-    y_res: f64,
     slot_count: usize,
+    /// Axis ranges of the pad, for centering/wrapping the drag finger.
+    x_range: (i32, i32),
+    y_range: (i32, i32),
+    /// Plausible contact size for the synthetic finger (libinput's
+    /// touch-size quirks discard touches that never report one).
+    synth_touch_major: Option<i32>,
+    /// Drag speed multiplier relative to cursor speed (config
+    /// `acceleration`; 1.0 = drags feel exactly like cursor movement).
+    accel: f64,
+    drag: DragFinger,
     frame: Vec<Ev>,
     /// True between a SYN_DROPPED and the SYN_REPORT that closes it:
     /// per the evdev protocol, everything in that window is garbage and
@@ -108,29 +142,6 @@ impl MtProxy {
 
         let synth = Self::clone_device(&real)?;
 
-        // Units-per-mm, from the device's reported resolution. Some
-        // touchpads (various Synaptics/Elan units) report resolution 0;
-        // treating that as 1 unit/mm would make drags 10-40x too fast,
-        // so fall back to estimating from the axis range against a
-        // typical pad size (~100mm x 70mm). Imperfect, but lands within
-        // a factor of ~2 -- the `acceleration` knob covers the rest.
-        let axis_res = |axis: AbsoluteAxis, assumed_mm: f64| -> f64 {
-            match real.absolute_info(axis) {
-                Ok(info) if info.resolution > 0 => info.resolution as f64,
-                Ok(info) if info.maximum > info.minimum => {
-                    let est = (info.maximum - info.minimum) as f64 / assumed_mm;
-                    warn!(
-                        "Touchpad reports no resolution for {:?}; estimating {:.1} units/mm \
-                        from its axis range (tune drag speed with `acceleration` if needed).",
-                        axis, est
-                    );
-                    est
-                }
-                _ => 1.0,
-            }
-        };
-        let x_res = axis_res(AbsoluteAxis::MultitouchPositionX, 100.0);
-        let y_res = axis_res(AbsoluteAxis::MultitouchPositionY, 70.0);
         // The device's real slot range: snapshot ioctls sized past it
         // return zeroed entries whose tracking_id 0 reads as "finger
         // down" -- the phantom-touch bug. Ask the device, don't assume.
@@ -138,26 +149,47 @@ impl MtProxy {
             .absolute_info(AbsoluteAxis::MultitouchSlot)
             .map(|i| (i.maximum as usize + 1).clamp(1, MAX_SLOTS))
             .unwrap_or(MAX_SLOTS);
+        let x_range = real
+            .absolute_info(AbsoluteAxis::MultitouchPositionX)
+            .map(|i| (i.minimum, i.maximum))
+            .unwrap_or((0, 1000));
+        let y_range = real
+            .absolute_info(AbsoluteAxis::MultitouchPositionY)
+            .map(|i| (i.minimum, i.maximum))
+            .unwrap_or((0, 1000));
+        // a mid-scale fingertip: big enough to pass libinput's touch-size
+        // quirks, small enough never to read as a palm/thumb
+        let synth_touch_major = real
+            .absolute_info(AbsoluteAxis::MultitouchTouchMajor)
+            .ok()
+            .map(|i| i.minimum + (i.maximum - i.minimum) / 4);
 
         Ok(MtProxy {
             real,
             synth,
             raw_fd,
-            x_res,
-            y_res,
             slot_count,
+            x_range,
+            y_range,
+            synth_touch_major,
+            accel: 1.0,
+            drag: DragFinger {
+                active: false,
+                pos: (0.0, 0.0),
+                emitted: (0, 0),
+                next_id: 61000,
+            },
             frame: Vec::with_capacity(READ_BATCH),
             dropping: false,
             read_buf: [zero_event(); READ_BATCH],
         })
     }
 
-    pub fn x_res(&self) -> f64 {
-        self.x_res
+    /// Drag speed relative to cursor speed (hot-reloadable).
+    pub fn set_accel(&mut self, accel: f64) {
+        self.accel = accel;
     }
-    pub fn y_res(&self) -> f64 {
-        self.y_res
-    }
+
     pub fn slot_count(&self) -> usize {
         self.slot_count
     }
@@ -230,11 +262,7 @@ impl MtProxy {
     /// the machine and applying its outputs. Returns when the fd would
     /// block. An `ENODEV` error means the device was unplugged /
     /// re-enumerated; the caller handles re-discovery.
-    pub fn drain(
-        &mut self,
-        machine: &mut GestureMachine,
-        vtp: &mut VirtualTrackpad,
-    ) -> io::Result<()> {
+    pub fn drain(&mut self, machine: &mut GestureMachine) -> io::Result<()> {
         loop {
             let n = match self.real.read(&mut self.read_buf) {
                 Ok(n) => n,
@@ -255,7 +283,7 @@ impl MtProxy {
                         self.dropping = false;
                         let snapshot = self.slot_snapshot()?;
                         let outs = machine.on_resync(&snapshot, Instant::now());
-                        self.apply(&outs, vtp)?;
+                        self.apply(&outs)?;
                     }
                     continue;
                 }
@@ -272,26 +300,154 @@ impl MtProxy {
                 if raw.type_ == EV_SYN && raw.code == SYN_REPORT {
                     let outs = machine.on_frame(&self.frame, Instant::now());
                     self.frame.clear();
-                    self.apply(&outs, vtp)?;
+                    self.apply(&outs)?;
                 }
             }
         }
     }
 
-    /// Applies the machine's outputs to the actual devices, in order.
-    pub fn apply(&mut self, outputs: &[Output], vtp: &mut VirtualTrackpad) -> io::Result<()> {
+    /// Applies the machine's outputs to the clone, in order.
+    pub fn apply(&mut self, outputs: &[Output]) -> io::Result<()> {
         for output in outputs {
             match output {
                 Output::EmitSynth(evs) => {
                     let raw: Vec<sys::input_event> = evs.iter().map(to_raw).collect();
                     self.synth.write(&raw)?;
                 }
-                Output::MouseDown => vtp.mouse_down()?,
-                Output::MouseUp => vtp.mouse_up()?,
-                Output::MouseMove { dx, dy } => vtp.mouse_move_relative(*dx, *dy)?,
+                Output::MouseDown => self.drag_down()?,
+                Output::MouseUp => self.drag_up()?,
+                Output::MouseMove { dx, dy } => self.drag_move(*dx, *dy)?,
             }
         }
         Ok(())
+    }
+
+    fn write_evs(&self, evs: &[(u16, u16, i32)]) -> io::Result<()> {
+        let mut raw: Vec<sys::input_event> = evs
+            .iter()
+            .map(|&(t, c, v)| {
+                let mut e = zero_event();
+                e.type_ = t;
+                e.code = c;
+                e.value = v;
+                e
+            })
+            .collect();
+        let mut syn = zero_event();
+        syn.type_ = EV_SYN;
+        syn.code = SYN_REPORT;
+        raw.push(syn);
+        self.synth.write(&raw)?;
+        Ok(())
+    }
+
+    fn center(&self) -> (i32, i32) {
+        (
+            (self.x_range.0 + self.x_range.1) / 2,
+            (self.y_range.0 + self.y_range.1) / 2,
+        )
+    }
+
+    fn touch_frame(&mut self, at: (i32, i32), with_button: bool) -> Vec<(u16, u16, i32)> {
+        let id = self.drag.next_id;
+        self.drag.next_id = if id >= 65000 { 61000 } else { id + 1 };
+        let mut evs = vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, id),
+            (EV_ABS, ABS_MT_POSITION_X, at.0),
+            (EV_ABS, ABS_MT_POSITION_Y, at.1),
+        ];
+        if let Some(major) = self.synth_touch_major {
+            evs.push((EV_ABS, ABS_MT_TOUCH_MAJOR, major));
+        }
+        evs.push((EV_KEY, BTN_TOUCH, 1));
+        evs.push((EV_KEY, BTN_TOOL_FINGER, 1));
+        if with_button {
+            evs.push((EV_KEY, BTN_LEFT, 1));
+        }
+        evs
+    }
+
+    /// Begin the drag: a synthetic finger lands at pad center with
+    /// BTN_LEFT pressed.
+    fn drag_down(&mut self) -> io::Result<()> {
+        let c = self.center();
+        self.drag.pos = (f64::from(c.0), f64::from(c.1));
+        self.drag.emitted = c;
+        self.drag.active = true;
+        let frame = self.touch_frame(c, true);
+        self.write_evs(&frame)
+    }
+
+    /// Move the synthetic finger by the reference finger's delta (in pad
+    /// units, scaled by the relative `acceleration`). Approaching a pad
+    /// edge lifts and re-lands the finger at center -- BTN_LEFT stays
+    /// held, so libinput keeps the drag alive through the hop.
+    fn drag_move(&mut self, dx: i32, dy: i32) -> io::Result<()> {
+        if !self.drag.active {
+            return Ok(());
+        }
+        self.drag.pos.0 += f64::from(dx) * self.accel;
+        self.drag.pos.1 += f64::from(dy) * self.accel;
+
+        let margin_x = (self.x_range.1 - self.x_range.0) / 10;
+        let margin_y = (self.y_range.1 - self.y_range.0) / 10;
+        let near_edge = self.drag.pos.0 < f64::from(self.x_range.0 + margin_x)
+            || self.drag.pos.0 > f64::from(self.x_range.1 - margin_x)
+            || self.drag.pos.1 < f64::from(self.y_range.0 + margin_y)
+            || self.drag.pos.1 > f64::from(self.y_range.1 - margin_y);
+        if near_edge {
+            // hop: lift (button stays), re-land centered
+            self.write_evs(&[
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                (EV_KEY, BTN_TOUCH, 0),
+                (EV_KEY, BTN_TOOL_FINGER, 0),
+            ])?;
+            let c = self.center();
+            self.drag.pos = (f64::from(c.0), f64::from(c.1));
+            self.drag.emitted = c;
+            let frame = self.touch_frame(c, false); // button already held
+            return self.write_evs(&frame);
+        }
+
+        let v = (
+            self.drag.pos.0.round() as i32,
+            self.drag.pos.1.round() as i32,
+        );
+        if v != self.drag.emitted {
+            let mut evs = vec![(EV_ABS, ABS_MT_SLOT, 0)];
+            if v.0 != self.drag.emitted.0 {
+                evs.push((EV_ABS, ABS_MT_POSITION_X, v.0));
+            }
+            if v.1 != self.drag.emitted.1 {
+                evs.push((EV_ABS, ABS_MT_POSITION_Y, v.1));
+            }
+            self.drag.emitted = v;
+            self.write_evs(&evs)?;
+        }
+        Ok(())
+    }
+
+    /// End the drag: release the finger and the button.
+    fn drag_up(&mut self) -> io::Result<()> {
+        if !self.drag.active {
+            return Ok(());
+        }
+        self.drag.active = false;
+        self.write_evs(&[
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_KEY, BTN_TOOL_FINGER, 0),
+            (EV_KEY, BTN_LEFT, 0),
+        ])
+    }
+
+    /// Defensive: release the drag finger/button if a drag was live
+    /// (shutdown, device loss).
+    pub fn release_drag(&mut self) -> io::Result<()> {
+        self.drag_up()
     }
 
     /// Authoritative per-slot state straight from the kernel

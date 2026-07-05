@@ -10,7 +10,7 @@ use tracing_subscriber::fmt::time::ChronoLocal;
 
 use linux_3_finger_drag::{
     init::{config, discovery},
-    runtime::{gesture::GestureMachine, mt_proxy::MtProxy, virtual_trackpad},
+    runtime::{gesture::GestureMachine, mt_proxy::MtProxy},
 };
 
 /// How often the config file's mtime is checked for hot reload.
@@ -102,25 +102,12 @@ async fn main() -> Result<(), io::Error> {
         }
     };
 
-    let mut vtrackpad = virtual_trackpad::start_handler()?;
-
-    // run() holds the real event loop; wrapping it like this guarantees
-    // the virtual devices are destroyed on the way out no matter how it
-    // returns (including the button being released if a drag was live).
-    let result = run(&args, configs, &mut vtrackpad).await;
-
+    let result = run(&args, configs).await;
     info!("Cleaning up and exiting...");
-    vtrackpad.mouse_up()?; // just in case a drag was in flight
-    vtrackpad.destruct()?;
-    info!("Clean up successful.");
     result
 }
 
-async fn run(
-    args: &Args,
-    mut cfg: config::Configuration,
-    vtp: &mut virtual_trackpad::VirtualTrackpad,
-) -> Result<(), io::Error> {
+async fn run(args: &Args, mut cfg: config::Configuration) -> Result<(), io::Error> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
@@ -149,12 +136,8 @@ async fn run(
         };
 
         let mut proxy = MtProxy::new(&path)?;
-        let mut machine = GestureMachine::new(
-            cfg.timing(),
-            proxy.x_res(),
-            proxy.y_res(),
-            proxy.slot_count(),
-        );
+        proxy.set_accel(cfg.acceleration);
+        let mut machine = GestureMachine::new(cfg.timing(), proxy.slot_count());
         let watch = AsyncFd::with_interest(FdWatch(proxy.as_raw_fd()), Interest::READABLE)?;
 
         info!("linux-3-finger-drag started successfully!");
@@ -166,7 +149,7 @@ async fn run(
             tokio::select! {
                 ready = watch.readable() => {
                     let mut guard = ready?;
-                    match proxy.drain(&mut machine, vtp) {
+                    match proxy.drain(&mut machine) {
                         Ok(()) => { guard.clear_ready(); }
                         Err(e) if is_unplug(&e) => break true,
                         Err(e) => return Err(e),
@@ -175,7 +158,7 @@ async fn run(
 
                 _ = sleep_until_opt(machine.next_deadline()) => {
                     let outs = machine.on_tick(std::time::Instant::now());
-                    proxy.apply(&outs, vtp)?;
+                    proxy.apply(&outs)?;
                 }
 
                 _ = cfg_timer.tick() => {
@@ -186,6 +169,7 @@ async fn run(
                         cfg_mtime = new_mtime;
                         cfg = config::init_cfg();
                         machine.set_timing(cfg.timing());
+                        proxy.set_accel(cfg.acceleration);
                         info!("Configuration reloaded (log settings need a restart).");
                     }
                 }
@@ -196,6 +180,7 @@ async fn run(
         };
 
         if !lost_device {
+            let _ = proxy.release_drag(); // just in case a drag was live
             proxy.destruct()?;
             return Ok(());
         }
@@ -206,7 +191,7 @@ async fn run(
         // backstop if it never comes back.
         warn!("Touchpad disappeared (ENODEV); attempting rediscovery...");
         if machine.button_held() {
-            vtp.mouse_up()?;
+            let _ = proxy.release_drag();
         }
         let _ = proxy.destruct();
 

@@ -16,7 +16,7 @@ use tracing_subscriber::{
     },
 };
 
-use crate::runtime::gesture::{Timing, PX_PER_MM};
+use crate::runtime::gesture::Timing;
 
 // This is simply a wrapper to allow deserialization of the
 // logLevel field into a tracing LevelFilter, albeit in
@@ -121,7 +121,6 @@ impl Configuration {
             entry_debounce: self.entry_debounce,
             drag_end_delay: self.drag_end_delay,
             press_grace: self.press_grace,
-            px_per_mm: PX_PER_MM * self.acceleration,
             four_finger_scale: self.four_finger_scale,
         }
     }

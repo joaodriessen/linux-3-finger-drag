@@ -251,34 +251,26 @@ fn end_to_end() {
         .expect("spawn proxy binary");
     let mut child = ChildGuard(child);
 
-    // wait for the proxy's two output devices to appear
-    let (clone_path, mouse_path) = {
+    // wait for the proxy's synthetic clone to appear (since the
+    // clone-side drag design there is no separate mouse device)
+    let clone_path = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let new: Vec<PathBuf> = list_event_nodes().difference(&before).cloned().collect();
-            let clone = new
+            if let Some(c) = new
                 .iter()
                 .find(|p| device_name(p).as_deref() == Some("3fd-integration-fake-touchpad"))
-                .cloned();
-            let mouse = new
-                .iter()
-                .find(|p| {
-                    device_name(p).as_deref()
-                        == Some("Virtual trackpad (created by linux-3-finger-drag)")
-                })
-                .cloned();
-            if let (Some(c), Some(m)) = (clone, mouse) {
-                break (c, m);
+            {
+                break c.clone();
             }
             assert!(
                 Instant::now() < deadline,
-                "proxy did not create its output devices within 10s"
+                "proxy did not create its clone device within 10s"
             );
             std::thread::sleep(Duration::from_millis(100));
         }
     };
     let clone = Reader::open(&clone_path).expect("open clone");
-    let mouse = Reader::open(&mouse_path).expect("open mouse");
 
     let f = |slot: i32, id: i32, x: i32, y: i32| -> Vec<(u16, u16, i32)> {
         vec![
@@ -317,10 +309,11 @@ fn end_to_end() {
         t == EV_ABS && c == ABS_MT_POSITION_X
     });
     assert!(ok, "single-finger motion never reached the clone: {seen:?}");
-    let mouse_noise = mouse.drain();
     assert!(
-        !mouse_noise.iter().any(|&(t, _, _)| t == EV_KEY),
-        "single-finger motion must not touch the mouse button: {mouse_noise:?}"
+        !seen
+            .iter()
+            .any(|&(t, c, v)| t == EV_KEY && c == BTN_LEFT && v == 1),
+        "single-finger motion must not press the button: {seen:?}"
     );
 
     // -- scenario 2: sustained 3-finger touch becomes a drag --------------
@@ -337,17 +330,21 @@ fn end_to_end() {
     // wiggle 2 units -- barely over one pixel of cursor motion
     pad.frame(&[(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_POSITION_X, 802)]);
 
-    let (_, got_down) = mouse.wait_for(Duration::from_secs(2), |&(t, c, v)| {
+    // the drag manifests ON THE CLONE: a synthetic finger + BTN_LEFT
+    let (during_drag, got_down) = clone.wait_for(Duration::from_secs(2), |&(t, c, v)| {
         t == EV_KEY && c == BTN_LEFT && v == 1
     });
-    assert!(got_down, "3-finger hold never pressed the virtual button");
-
-    let leaked = clone.drain();
     assert!(
-        !leaked
+        got_down,
+        "3-finger hold never pressed the button on the clone"
+    );
+    // the real 3 fingers (ids 200-202) must never leak; only the
+    // synthetic drag finger (ids >= 61000) may appear
+    assert!(
+        !during_drag
             .iter()
-            .any(|&(t, c, _)| t == EV_ABS && c == ABS_MT_TRACKING_ID),
-        "the 3-finger touch leaked to the compositor: {leaked:?}"
+            .any(|&(t, c, v)| t == EV_ABS && c == ABS_MT_TRACKING_ID && (200..=202).contains(&v)),
+        "the real 3-finger touch leaked to the compositor: {during_drag:?}"
     );
 
     // lift all three (staggered, like real fingers)
@@ -362,16 +359,15 @@ fn end_to_end() {
         (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
     ]);
 
-    let (_, got_up) = mouse.wait_for(Duration::from_secs(2), |&(t, c, v)| {
+    let (after_drag, got_up) = clone.wait_for(Duration::from_secs(2), |&(t, c, v)| {
         t == EV_KEY && c == BTN_LEFT && v == 0
     });
-    assert!(got_up, "drag never released the virtual button");
-    let leaked = clone.drain();
+    assert!(got_up, "drag never released the button on the clone");
     assert!(
-        !leaked
+        !after_drag
             .iter()
-            .any(|&(t, c, _)| t == EV_ABS && c == ABS_MT_TRACKING_ID),
-        "the staggered 3-finger liftoff leaked to the compositor: {leaked:?}"
+            .any(|&(t, c, v)| t == EV_ABS && c == ABS_MT_TRACKING_ID && (200..=202).contains(&v)),
+        "the staggered 3-finger liftoff leaked to the compositor: {after_drag:?}"
     );
 
     // -- scenario 3: 4-finger touch passes through untouched --------------
@@ -407,10 +403,11 @@ fn end_to_end() {
         ok,
         "4-finger touch did not pass through to the clone: {seen:?}"
     );
-    let mouse_noise = mouse.drain();
     assert!(
-        !mouse_noise.iter().any(|&(t, _, _)| t == EV_KEY),
-        "4-finger touch must not press the mouse button: {mouse_noise:?}"
+        !seen
+            .iter()
+            .any(|&(t, c, v)| t == EV_KEY && c == BTN_LEFT && v == 1),
+        "4-finger touch must not press the button: {seen:?}"
     );
 
     // -- shutdown ----------------------------------------------------------

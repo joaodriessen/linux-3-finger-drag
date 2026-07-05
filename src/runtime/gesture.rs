@@ -58,12 +58,6 @@ const AUX_UNSEEN: i32 = i32::MIN;
 /// device's ABS_MT_SLOT range at construction.
 pub const MAX_SLOTS: usize = 16;
 
-/// px-per-mm scale for turning the real finger delta into cursor
-/// movement; combines with the `acceleration` config knob on top.
-/// 12.0 (4.0 x the initial guess) is the value confirmed to feel right
-/// live on the MacBookPro11,3 pad.
-pub const PX_PER_MM: f64 = 12.0;
-
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
 /// written to uinput anyway).
@@ -95,8 +89,11 @@ pub enum Output {
     MouseDown,
     /// Release the virtual mouse's left button.
     MouseUp,
-    /// Move the cursor by whole pixels (fractional remainders are
-    /// carried inside the machine so slow drags don't lose motion).
+    /// Drag motion: the reference finger's RAW delta in pad units. The
+    /// I/O shell applies it to a synthetic finger on the clone, so drags
+    /// ride the exact same libinput touchpad pipeline (acceleration
+    /// curve, speed setting) as ordinary cursor movement -- identical
+    /// feel by construction.
     MouseMove { dx: i32, dy: i32 },
 }
 
@@ -122,8 +119,6 @@ pub struct Timing {
     /// faster the hand comes down) can abort the misclassified drag
     /// without a phantom click ever having been sent.
     pub press_grace: Duration,
-    /// Combined px-per-mm * user acceleration factor.
-    pub px_per_mm: f64,
     /// Motion scale applied to touches of 4+ fingers as they are relayed
     /// to the compositor (anchored at each finger's touchdown position).
     /// Compositor gestures (KWin's 4-finger desktop-switch/overview) have
@@ -201,8 +196,6 @@ impl Default for ScaleSlot {
 
 pub struct GestureMachine {
     timing: Timing,
-    x_res: f64,
-    y_res: f64,
     slot_count: usize,
 
     slots: [Slot; MAX_SLOTS],
@@ -214,8 +207,6 @@ pub struct GestureMachine {
     suppressing: bool,
     drag_ref_slot: Option<usize>,
     drag_last_pos: Option<(i32, i32)>,
-    /// Sub-pixel motion carried between frames.
-    carry: (f64, f64),
     /// While a committed drag hasn't moved yet: when to press the button
     /// anyway (see [`Timing::press_grace`]). Cleared once pressed.
     press_deadline: Option<Instant>,
@@ -259,11 +250,9 @@ pub struct GestureMachine {
 }
 
 impl GestureMachine {
-    pub fn new(timing: Timing, x_res: f64, y_res: f64, slot_count: usize) -> Self {
+    pub fn new(timing: Timing, slot_count: usize) -> Self {
         GestureMachine {
             timing,
-            x_res: x_res.max(1.0),
-            y_res: y_res.max(1.0),
             slot_count: slot_count.clamp(1, MAX_SLOTS),
             slots: [Slot::default(); MAX_SLOTS],
             current_slot: 0,
@@ -271,7 +260,6 @@ impl GestureMachine {
             suppressing: false,
             drag_ref_slot: None,
             drag_last_pos: None,
-            carry: (0.0, 0.0),
             press_deadline: None,
             drag_commit_time: None,
             drag_px_total: (0, 0),
@@ -505,7 +493,7 @@ impl GestureMachine {
             if count == 0 {
                 if let Some(t0) = self.drag_commit_time.take() {
                     debug!(
-                        "DRAG END after {}ms: moved |{}|,|{}| px, max frame delta {} px",
+                        "DRAG END after {}ms: moved |{}|,|{}| units, max frame delta {} units",
                         now.duration_since(t0).as_millis(),
                         self.drag_px_total.0,
                         self.drag_px_total.1,
@@ -913,7 +901,6 @@ impl GestureMachine {
     fn enter_suppress(&mut self, out: &mut Vec<Output>) {
         self.suppressing = true;
         self.lock_deadline = None; // a live drag owns the button now
-        self.carry = (0.0, 0.0);
 
         let mut release = Vec::new();
         for slot in 0..MAX_SLOTS {
@@ -969,19 +956,13 @@ impl GestureMachine {
 
         let (x, y) = (self.slots[reference].x, self.slots[reference].y);
         if let Some((lx, ly)) = self.drag_last_pos {
-            let px = (x - lx) as f64 / self.x_res * self.timing.px_per_mm + self.carry.0;
-            let py = (y - ly) as f64 / self.y_res * self.timing.px_per_mm + self.carry.1;
-            let dx = px.trunc() as i32;
-            let dy = py.trunc() as i32;
-            // carry the sub-pixel remainder instead of discarding it, so
-            // slow, precise drags don't systematically lose motion
-            self.carry = (px - dx as f64, py - dy as f64);
+            let (dx, dy) = (x - lx, y - ly);
             if dx != 0 || dy != 0 {
                 // real drag motion: the deferred press (if still pending)
                 // must land before the movement it accompanies
                 self.press_button(out);
-                self.drag_px_total.0 += dx.unsigned_abs() as i64;
-                self.drag_px_total.1 += dy.unsigned_abs() as i64;
+                self.drag_px_total.0 += i64::from(dx.unsigned_abs());
+                self.drag_px_total.1 += i64::from(dy.unsigned_abs());
                 self.drag_px_max_frame = self.drag_px_max_frame.max(dx.abs().max(dy.abs()));
                 out.push(Output::MouseMove { dx, dy });
             }
