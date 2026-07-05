@@ -68,8 +68,19 @@ pub const MAX_SLOTS: usize = 16;
 /// flicks are biomechanically slower, so the same "fraction of the pad
 /// per second" is the fair bar for both directions (and it's
 /// resolution-independent across hardware).
-const FLICK_LO_PADS_S: f64 = 0.95;
-const FLICK_HI_PADS_S: f64 = 2.6;
+const FLICK_LO_PADS_S: f64 = 0.9;
+const FLICK_HI_PADS_S: f64 = 1.8;
+
+/// Liftoff glide ("inertia"): when a flicked 4+ finger touch lifts, the
+/// clone's fingers keep moving with decaying velocity before releasing,
+/// so the gesture receives the travel the flick physically implied --
+/// including whatever was lost to recognition latency and late-landing
+/// fingers. Step cadence, per-step decay, minimum speed to keep
+/// gliding, and a hard time cap.
+const GLIDE_STEP: Duration = Duration::from_millis(10);
+const GLIDE_DECAY: f64 = 0.82;
+const GLIDE_MIN_PADS_S: f64 = 0.15;
+const GLIDE_MAX: Duration = Duration::from_millis(240);
 
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
@@ -244,6 +255,14 @@ pub struct GestureMachine {
     /// letting the scale sag back down there would eat the tail of the
     /// gesture's travel -- "once flicked, committed", like macOS.
     flick_latched: bool,
+    /// Signed smoothed gesture velocity (units/s per axis), the glide's
+    /// launch vector.
+    flick_dir: (f64, f64),
+    /// Liftoff glide state: the clone's fingers are coasting.
+    glide_active: bool,
+    glide_v: (f64, f64),
+    glide_next: Option<Instant>,
+    glide_until: Option<Instant>,
     /// When the previous scaled frame was processed (for velocity dt).
     last_scaled_at: Option<Instant>,
     /// Per-slot scaling state: what the clone was last told (tracking id
@@ -267,6 +286,11 @@ pub struct GestureMachine {
     pending: Vec<Ev>,
     touch_start: Option<Instant>,
     touch_max: usize,
+    /// Distinct contacts seen across the whole touch (fast, grazing
+    /// flicks can have contacts that never overlap in time -- max
+    /// simultaneous undercounts them).
+    touch_distinct: u32,
+    touch_travel: (i64, i64),
     settled: bool,
 
     /// Virtual left button state (survives across touches for drag-lock).
@@ -296,6 +320,11 @@ impl GestureMachine {
             scaled_touch: false,
             flick_velocity: 0.0,
             flick_latched: false,
+            flick_dir: (0.0, 0.0),
+            glide_active: false,
+            glide_v: (0.0, 0.0),
+            glide_next: None,
+            glide_until: None,
             last_scaled_at: None,
             scale_slots: [ScaleSlot::default(); MAX_SLOTS],
             real_keys: Vec::new(),
@@ -303,6 +332,8 @@ impl GestureMachine {
             pending: Vec::new(),
             touch_start: None,
             touch_max: 0,
+            touch_distinct: 0,
+            touch_travel: (0, 0),
             settled: false,
             held: false,
             lock_deadline: None,
@@ -321,10 +352,18 @@ impl GestureMachine {
         self.held
     }
 
+    /// Whether the clone's fingers are coasting after a flick.
+    pub fn is_gliding(&self) -> bool {
+        self.glide_active
+    }
+
     /// The next instant at which [`on_tick`](Self::on_tick) has work to
     /// do, if any. The I/O loop sleeps exactly until this, so decisions
     /// land on time instead of on the next poll interval.
     pub fn next_deadline(&self) -> Option<Instant> {
+        if self.glide_active {
+            return self.glide_next;
+        }
         if self.suppressing {
             // a committed drag that hasn't moved yet still owes a
             // deferred button press
@@ -349,6 +388,10 @@ impl GestureMachine {
     /// drag-lock timeout.
     pub fn on_tick(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
+        if self.glide_active {
+            self.step_glide(now, &mut out);
+            return out;
+        }
         if self.suppressing {
             // Stationary drag: no motion has pressed the button yet, and
             // no 4th finger has shown up to abort -- commit the press.
@@ -408,9 +451,26 @@ impl GestureMachine {
                 ABS_MT_SLOT => {
                     self.current_slot = (ev.value.max(0) as usize).min(self.slot_count - 1);
                 }
-                ABS_MT_TRACKING_ID => self.slots[self.current_slot].tracking_id = ev.value,
-                ABS_MT_POSITION_X => self.slots[self.current_slot].x = ev.value,
-                ABS_MT_POSITION_Y => self.slots[self.current_slot].y = ev.value,
+                ABS_MT_TRACKING_ID => {
+                    if ev.value >= 0 && self.slots[self.current_slot].tracking_id < 0 {
+                        self.touch_distinct += 1;
+                    }
+                    self.slots[self.current_slot].tracking_id = ev.value;
+                }
+                ABS_MT_POSITION_X => {
+                    let s = &mut self.slots[self.current_slot];
+                    if s.tracking_id >= 0 {
+                        self.touch_travel.0 += i64::from((ev.value - s.x).abs());
+                    }
+                    s.x = ev.value;
+                }
+                ABS_MT_POSITION_Y => {
+                    let s = &mut self.slots[self.current_slot];
+                    if s.tracking_id >= 0 {
+                        self.touch_travel.1 += i64::from((ev.value - s.y).abs());
+                    }
+                    s.y = ev.value;
+                }
                 code => {
                     if let Some(i) = MT_AUX_CODES.iter().position(|&c| c == code) {
                         self.slots[self.current_slot].aux[i] = ev.value;
@@ -497,6 +557,23 @@ impl GestureMachine {
         out
     }
 
+    /// Per-touch diagnostic: what did the REAL pad actually report?
+    fn log_touch_autopsy(&mut self, now: Instant, kind: &str) {
+        if let Some(t0) = self.touch_start {
+            debug!(
+                "TOUCH END ({kind}): {}ms, max_simultaneous={}, distinct_contacts={}, travel=|{}|,|{}| units, latched={}",
+                now.duration_since(t0).as_millis(),
+                self.touch_max,
+                self.touch_distinct,
+                self.touch_travel.0,
+                self.touch_travel.1,
+                self.flick_latched,
+            );
+        }
+        self.touch_distinct = 0;
+        self.touch_travel = (0, 0);
+    }
+
     // ---- internals ----------------------------------------------------
 
     fn active_slots(&self) -> Vec<usize> {
@@ -515,6 +592,17 @@ impl GestureMachine {
         let active = self.active_slots();
         let count = active.len();
 
+        // The clone's fingers may still be coasting from a flick: a new
+        // real touch needs the clone free immediately, and empty frames
+        // from the (empty) pad are none of our business -- the glide
+        // owns the clone until it ends.
+        if self.glide_active {
+            if count == 0 {
+                return;
+            }
+            self.end_glide(out);
+        }
+
         // Once a drag has started, stay suppressed until every finger is
         // off, not just until the count first drops below 3. Fingers
         // never lift in perfect unison; without this hysteresis the
@@ -523,6 +611,7 @@ impl GestureMachine {
         // the moment they lift too.
         if self.suppressing {
             if count == 0 {
+                self.log_touch_autopsy(now, "drag");
                 if let Some(t0) = self.drag_commit_time.take() {
                     debug!(
                         "DRAG END after {}ms: moved |{}|,|{}| units, max frame delta {} units",
@@ -592,6 +681,7 @@ impl GestureMachine {
 
         if count == 0 {
             let had_pending = self.touch_start.is_some() && !self.settled;
+            self.log_touch_autopsy(now, if had_pending { "tap" } else { "relayed" });
             self.touch_start = None;
             self.touch_max = 0;
             self.settled = false;
@@ -606,12 +696,15 @@ impl GestureMachine {
             // Already-settled touch ending (most touches): this frame
             // carries the release events the compositor needs to see.
             if self.scaled_touch {
-                self.sync_scaled(now, out); // diff emits the releases + key zeros
-                self.scaled_touch = false;
-                self.flick_velocity = 0.0;
-                self.flick_latched = false;
-                self.last_scaled_at = None;
-                self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
+                if self.flick_latched {
+                    // Inertia: don't release the clone's fingers -- let
+                    // them coast (see on_tick) so the gesture receives
+                    // the travel the flick physically implied.
+                    self.start_glide(now);
+                } else {
+                    self.sync_scaled(now, out); // diff emits releases + key zeros
+                    self.reset_scaled_state();
+                }
             } else {
                 self.relay_frame(frame, out);
             }
@@ -622,6 +715,8 @@ impl GestureMachine {
             // the first frame of a brand new touch
             self.touch_start = Some(now);
             self.touch_max = count;
+            self.touch_distinct = count as u32;
+            self.touch_travel = (0, 0);
             self.settled = false;
             self.pending.clear();
         } else {
@@ -838,13 +933,16 @@ impl GestureMachine {
         if let Some(dt_s) = dt_s {
             // (the first frame after activation only seeds the clock --
             // there is no baseline to take a velocity sample against)
-            let (mut travel_x, mut travel_y, mut moving) = (0.0f64, 0.0f64, 0u32);
+            let (mut travel_x, mut travel_y, mut signed_x, mut signed_y, mut moving) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0u32);
             for slot in 0..self.slot_count {
                 let real = self.slots[slot];
                 let ss = &self.scale_slots[slot];
                 if real.tracking_id >= 0 && ss.clone_id == real.tracking_id {
                     travel_x += f64::from((real.x - ss.last_real.0).abs());
                     travel_y += f64::from((real.y - ss.last_real.1).abs());
+                    signed_x += f64::from(real.x - ss.last_real.0);
+                    signed_y += f64::from(real.y - ss.last_real.1);
                     moving += 1;
                 }
             }
@@ -856,6 +954,10 @@ impl GestureMachine {
                 // are its FIRST frames, and a slow estimator burns them
                 // at the calm scale
                 self.flick_velocity = 0.3 * self.flick_velocity + 0.7 * v;
+                self.flick_dir.0 =
+                    0.3 * self.flick_dir.0 + 0.7 * (signed_x / f64::from(moving) / dt_s);
+                self.flick_dir.1 =
+                    0.3 * self.flick_dir.1 + 0.7 * (signed_y / f64::from(moving) / dt_s);
             }
         }
         let t = ((self.flick_velocity - FLICK_LO_PADS_S) / (FLICK_HI_PADS_S - FLICK_LO_PADS_S))
@@ -948,6 +1050,113 @@ impl GestureMachine {
             frame.push(Ev::syn());
             out.push(Output::EmitSynth(frame));
         }
+    }
+
+    fn reset_scaled_state(&mut self) {
+        self.scaled_touch = false;
+        self.flick_velocity = 0.0;
+        self.flick_latched = false;
+        self.flick_dir = (0.0, 0.0);
+        self.last_scaled_at = None;
+        self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
+    }
+
+    fn start_glide(&mut self, now: Instant) {
+        debug!(
+            "GLIDE start: v=({:.0},{:.0}) units/s",
+            self.flick_dir.0, self.flick_dir.1
+        );
+        self.glide_active = true;
+        self.glide_v = self.flick_dir;
+        self.glide_next = Some(now + GLIDE_STEP);
+        self.glide_until = Some(now + GLIDE_MAX);
+        // scaled_touch stays true only in the sense that scale_slots
+        // still describe the clone; classification state resets so the
+        // next real touch is judged from scratch
+        self.scaled_touch = false;
+        self.flick_velocity = 0.0;
+        self.flick_latched = false;
+        self.last_scaled_at = None;
+    }
+
+    /// One coasting step: advance every still-active clone finger along
+    /// the (decaying) launch vector.
+    fn step_glide(&mut self, now: Instant, out: &mut Vec<Output>) {
+        let Some(mut next) = self.glide_next else {
+            return;
+        };
+        let until = self.glide_until.unwrap_or(now);
+        let mut frame = Vec::new();
+        while now >= next {
+            let dt = GLIDE_STEP.as_secs_f64();
+            for slot in 0..self.slot_count {
+                let ss = &mut self.scale_slots[slot];
+                if ss.clone_id >= 0 {
+                    ss.virt.0 += self.glide_v.0 * dt;
+                    ss.virt.1 += self.glide_v.1 * dt;
+                    let v = (ss.virt.0.round() as i32, ss.virt.1.round() as i32);
+                    if v != ss.clone_pos {
+                        frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
+                        if v.0 != ss.clone_pos.0 {
+                            frame.push(Ev::abs(ABS_MT_POSITION_X, v.0));
+                        }
+                        if v.1 != ss.clone_pos.1 {
+                            frame.push(Ev::abs(ABS_MT_POSITION_Y, v.1));
+                        }
+                        ss.clone_pos = v;
+                    }
+                }
+            }
+            self.glide_v.0 *= GLIDE_DECAY;
+            self.glide_v.1 *= GLIDE_DECAY;
+            next += GLIDE_STEP;
+
+            let speed_pads =
+                (self.glide_v.0.abs() / self.x_extent).max(self.glide_v.1.abs() / self.y_extent);
+            if speed_pads < GLIDE_MIN_PADS_S || next > until {
+                if !frame.is_empty() {
+                    frame.push(Ev::syn());
+                    out.push(Output::EmitSynth(std::mem::take(&mut frame)));
+                }
+                self.end_glide(out);
+                return;
+            }
+        }
+        self.glide_next = Some(next);
+        if !frame.is_empty() {
+            frame.push(Ev::syn());
+            out.push(Output::EmitSynth(frame));
+        }
+    }
+
+    /// Release the coasting fingers and their tool state.
+    fn end_glide(&mut self, out: &mut Vec<Output>) {
+        let mut frame = Vec::new();
+        for slot in 0..self.slot_count {
+            if self.scale_slots[slot].clone_id >= 0 {
+                frame.push(Ev::abs(ABS_MT_SLOT, slot as i32));
+                frame.push(Ev::abs(ABS_MT_TRACKING_ID, -1));
+            }
+        }
+        for i in 0..self.clone_keys.len() {
+            if self.clone_keys[i].1 != 0 {
+                frame.push(Ev::new(EV_KEY, self.clone_keys[i].0, 0));
+                self.clone_keys[i].1 = 0;
+            }
+        }
+        if !frame.is_empty() {
+            frame.push(Ev::syn());
+            out.push(Output::EmitSynth(frame));
+        }
+        self.glide_active = false;
+        self.glide_next = None;
+        self.glide_until = None;
+        self.glide_v = (0.0, 0.0);
+        self.reset_scaled_state();
+        // the clone is now empty -- NOT mark_relayed(): a new real touch
+        // may already be down (and still buffered, unseen by the clone)
+        self.relayed_active = [false; MAX_SLOTS];
+        debug!("GLIDE end: fingers released");
     }
 
     fn relay_frame(&mut self, frame: &[Ev], out: &mut Vec<Output>) {

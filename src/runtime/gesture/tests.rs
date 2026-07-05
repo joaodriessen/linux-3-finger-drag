@@ -851,6 +851,120 @@ fn intro_and_scaled_relay_forward_touch_size() {
     );
 }
 
+/// INERTIA: when a flicked 4-finger touch lifts, the clone's fingers
+/// coast on with decaying velocity before releasing -- delivering the
+/// travel the flick physically implied (KWin gestures complete instead
+/// of bouncing back), like macOS momentum.
+#[test]
+fn flicked_touch_glides_after_liftoff() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 700),
+        &down(1, 2, 1200, 700),
+        &down(2, 3, 1400, 700),
+        &down(3, 4, 1600, 700),
+    ]));
+    // two fast frames to latch the flick (and set the launch vector)
+    for step in 1..=2 {
+        sim.frame_at(
+            8,
+            &cat(&[
+                &mv(0, 1000 + step * 240, 700),
+                &mv(1, 1200 + step * 240, 700),
+                &mv(2, 1400 + step * 240, 700),
+                &mv(3, 1600 + step * 240, 700),
+            ]),
+        );
+    }
+
+    // liftoff: NO release may be emitted -- the fingers coast
+    let outs = sim.frame_at(8, &cat(&[&up(0), &up(1), &up(2), &up(3)]));
+    let evs = synth_events(&outs);
+    assert!(
+        !evs.iter()
+            .any(|e| e.code == ABS_MT_TRACKING_ID && e.value == -1),
+        "a flicked liftoff must start a glide, not release: {evs:?}"
+    );
+    assert!(sim.m.is_gliding());
+    assert!(sim.m.next_deadline().is_some(), "glide must schedule steps");
+
+    // coasting: glide steps keep emitting forward motion...
+    let outs = sim.tick(20);
+    let (dx, _) = {
+        let evs = synth_events(&outs);
+        let xs: Vec<i32> = evs
+            .iter()
+            .filter(|e| e.code == ABS_MT_POSITION_X)
+            .map(|e| e.value)
+            .collect();
+        (xs.len(), xs)
+    };
+    assert!(dx > 0, "glide steps must move the coasting fingers");
+
+    // ...and the glide ends by itself: everything released, keys zeroed
+    let mut all = Vec::new();
+    for _ in 0..30 {
+        all = collect(all, sim.tick(10));
+    }
+    let evs = synth_events(&all);
+    let releases = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID && e.value == -1)
+        .count();
+    assert_eq!(
+        releases, 4,
+        "glide must release all fingers when done: {evs:?}"
+    );
+    assert!(!sim.m.is_gliding());
+    assert_eq!(
+        sim.m.next_deadline(),
+        None,
+        "nothing scheduled after the glide"
+    );
+
+    // and a fresh touch afterwards behaves normally
+    let outs = sim.frame_at(20, &down(0, 50, 500, 500));
+    assert!(
+        synth_events(&outs).is_empty(),
+        "fresh touch buffers normally"
+    );
+}
+
+/// A new real touch during a glide takes the clone over cleanly: the
+/// coasting fingers release BEFORE the new touch is (later) introduced.
+#[test]
+fn new_touch_during_glide_ends_it_first() {
+    let mut sim = Sim::with_scale(0.5);
+    sim.frame(&cat(&[
+        &down(0, 1, 1000, 700),
+        &down(1, 2, 1200, 700),
+        &down(2, 3, 1400, 700),
+        &down(3, 4, 1600, 700),
+    ]));
+    for step in 1..=2 {
+        sim.frame_at(
+            8,
+            &cat(&[
+                &mv(0, 1000 + step * 240, 700),
+                &mv(1, 1200 + step * 240, 700),
+                &mv(2, 1400 + step * 240, 700),
+                &mv(3, 1600 + step * 240, 700),
+            ]),
+        );
+    }
+    sim.frame_at(8, &cat(&[&up(0), &up(1), &up(2), &up(3)]));
+    assert!(sim.m.is_gliding());
+
+    let outs = sim.frame_at(30, &down(5, 60, 800, 800));
+    assert!(!sim.m.is_gliding(), "a new touch must end the glide");
+    let evs = synth_events(&outs);
+    let releases = evs
+        .iter()
+        .filter(|e| e.code == ABS_MT_TRACKING_ID && e.value == -1)
+        .count();
+    assert_eq!(releases, 4, "the coasting fingers must release: {evs:?}");
+}
+
 // =========================================================================
 // drag-lock (drag_end_delay > 0)
 // =========================================================================

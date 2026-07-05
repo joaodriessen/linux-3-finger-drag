@@ -295,9 +295,11 @@ fn run_scenario_scaled(seed: u64, drag_end_delay_ms: u64, four_finger_scale: f64
             "button-state desync (seed {seed}, step {step})"
         );
         // 3. the clone never has MORE active slots than the real pad
-        //    (it may briefly have fewer: buffered/suppressed touches)
+        //    (it may briefly have fewer: buffered/suppressed touches) --
+        //    EXCEPT while gliding, when the clone's fingers deliberately
+        //    coast past the physical liftoff
         assert!(
-            shadow.active_count() <= hand.count(),
+            m.is_gliding() || shadow.active_count() <= hand.count(),
             "clone shows {} touches, real pad has {} (seed {seed}, step {step})",
             shadow.active_count(),
             hand.count()
