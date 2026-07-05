@@ -69,7 +69,7 @@ pub const MAX_SLOTS: usize = 16;
 /// per second" is the fair bar for both directions (and it's
 /// resolution-independent across hardware).
 const FLICK_LO_PADS_S: f64 = 0.95;
-const FLICK_HI_PADS_S: f64 = 3.3;
+const FLICK_HI_PADS_S: f64 = 2.6;
 
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
@@ -236,9 +236,14 @@ pub struct GestureMachine {
     /// True while the current settled touch is being relayed with
     /// four_finger_scale applied (state-diff relay instead of verbatim).
     scaled_touch: bool,
-    /// Smoothed finger velocity (mm/s) of the scaled touch, for the
-    /// flick ramp.
+    /// Smoothed finger velocity (pad-lengths/s) of the scaled touch,
+    /// for the flick ramp.
     flick_velocity: f64,
+    /// Once a touch reaches full flick speed it stays unscaled for the
+    /// REST of the touch: fingers always decelerate before liftoff, and
+    /// letting the scale sag back down there would eat the tail of the
+    /// gesture's travel -- "once flicked, committed", like macOS.
+    flick_latched: bool,
     /// When the previous scaled frame was processed (for velocity dt).
     last_scaled_at: Option<Instant>,
     /// Per-slot scaling state: what the clone was last told (tracking id
@@ -290,6 +295,7 @@ impl GestureMachine {
             drag_px_max_frame: 0,
             scaled_touch: false,
             flick_velocity: 0.0,
+            flick_latched: false,
             last_scaled_at: None,
             scale_slots: [ScaleSlot::default(); MAX_SLOTS],
             real_keys: Vec::new(),
@@ -603,6 +609,7 @@ impl GestureMachine {
                 self.sync_scaled(now, out); // diff emits the releases + key zeros
                 self.scaled_touch = false;
                 self.flick_velocity = 0.0;
+                self.flick_latched = false;
                 self.last_scaled_at = None;
                 self.scale_slots = [ScaleSlot::default(); MAX_SLOTS];
             } else {
@@ -806,6 +813,7 @@ impl GestureMachine {
         }
         self.scaled_touch = true;
         self.flick_velocity = 0.0;
+        self.flick_latched = false;
         self.last_scaled_at = None;
         debug!(
             "4+ finger touch: relaying with motion scale {} (flick ramp to 1.0 above {} pad-lengths/s)",
@@ -849,9 +857,16 @@ impl GestureMachine {
         }
         let t = ((self.flick_velocity - FLICK_LO_PADS_S) / (FLICK_HI_PADS_S - FLICK_LO_PADS_S))
             .clamp(0.0, 1.0);
-        let t = t * t * (3.0 - 2.0 * t); // smoothstep
-        let base = self.timing.four_finger_scale;
-        let scale = base + (1.0 - base) * t;
+        if t >= 1.0 {
+            self.flick_latched = true;
+        }
+        let scale = if self.flick_latched {
+            1.0
+        } else {
+            let t = t * t * (3.0 - 2.0 * t); // smoothstep
+            let base = self.timing.four_finger_scale;
+            base + (1.0 - base) * t
+        };
 
         let mut frame = Vec::new();
         for slot in 0..self.slot_count {

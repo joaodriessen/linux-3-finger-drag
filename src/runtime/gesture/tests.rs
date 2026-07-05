@@ -711,6 +711,24 @@ fn four_finger_flick_passes_at_full_scale() {
         evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1360)),
         "flick-speed motion must pass unscaled by the 2nd frame: {evs:?}"
     );
+
+    // THE LATCH: fingers decelerate before liftoff; the deceleration
+    // tail must STAY unscaled once the touch has flicked, or the last
+    // stretch of travel gets eaten and the gesture falls short.
+    let outs = sim.frame_at(
+        1000, // deceleration: 200 units over 1s = well below the band
+        &cat(&[
+            &mv(0, 1680, 700),
+            &mv(1, 1880, 700),
+            &mv(2, 2000, 700),
+            &mv(3, 2000, 700),
+        ]),
+    );
+    let evs = synth_events(&outs);
+    assert!(
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1560)),
+        "post-flick deceleration must stay unscaled (latched): {evs:?}"
+    );
 }
 
 /// Liftoff of a scaled touch must release every slot on the clone
