@@ -852,13 +852,30 @@ impl GestureMachine {
                 let vx = travel_x / f64::from(moving) / self.x_extent / dt_s;
                 let vy = travel_y / f64::from(moving) / self.y_extent / dt_s;
                 let v = vx.max(vy);
-                self.flick_velocity = 0.5 * self.flick_velocity + 0.5 * v;
+                // weight new samples heavily: a flick's fastest frames
+                // are its FIRST frames, and a slow estimator burns them
+                // at the calm scale
+                self.flick_velocity = 0.3 * self.flick_velocity + 0.7 * v;
             }
         }
         let t = ((self.flick_velocity - FLICK_LO_PADS_S) / (FLICK_HI_PADS_S - FLICK_LO_PADS_S))
             .clamp(0.0, 1.0);
-        if t >= 1.0 {
+        if t >= 1.0 && !self.flick_latched {
             self.flick_latched = true;
+            // Retroactive momentum: restore the travel withheld while
+            // the ramp was still recognizing the flick. Snapping each
+            // virtual finger to its last real position (the pending
+            // frame's delta is applied unscaled below) hands the
+            // compositor the flick's FULL physical travel -- without
+            // this, the scaled-down early frames leave short-axis
+            // gestures short of their completion distance.
+            for slot in 0..self.slot_count {
+                let real = self.slots[slot];
+                let ss = &mut self.scale_slots[slot];
+                if real.tracking_id >= 0 && ss.clone_id == real.tracking_id {
+                    ss.virt = (f64::from(ss.last_real.0), f64::from(ss.last_real.1));
+                }
+            }
         }
         let scale = if self.flick_latched {
             1.0

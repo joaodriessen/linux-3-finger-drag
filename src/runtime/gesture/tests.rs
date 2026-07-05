@@ -705,11 +705,13 @@ fn four_finger_flick_passes_at_full_scale() {
         ]),
     );
     let evs = synth_events(&outs);
-    // frame 1 emitted anchor+120 (still 0.5-scaled); frame 2's +240 must
-    // pass through whole: 1120 + 240 = 1360
+    // frame 1 emitted anchor+120 (still 0.5-scaled). Frame 2 latches the
+    // flick AND catches up the withheld travel: the virtual finger snaps
+    // to the real one, so the clone sees the full physical position
+    // (anchor + 240 + 240 = 1480), not just the unscaled tail.
     assert!(
-        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1360)),
-        "flick-speed motion must pass unscaled by the 2nd frame: {evs:?}"
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1480)),
+        "a latched flick must deliver its full physical travel: {evs:?}"
     );
 
     // THE LATCH: fingers decelerate before liftoff; the deceleration
@@ -725,8 +727,9 @@ fn four_finger_flick_passes_at_full_scale() {
         ]),
     );
     let evs = synth_events(&outs);
+    // latched + caught-up: the virtual finger now tracks the real one
     assert!(
-        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1560)),
+        evs.contains(&Ev::abs(ABS_MT_POSITION_X, 1680)),
         "post-flick deceleration must stay unscaled (latched): {evs:?}"
     );
 }
