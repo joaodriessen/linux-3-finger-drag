@@ -1,16 +1,27 @@
 > [!IMPORTANT]
-> **If you're on libinput ≥ 1.28, you probably don't need this.** libinput
-> now has native three-finger dragging built in; it's just disabled by
-> default and most compositors don't expose a switch. Enabling it is far
-> simpler and more robust than this proxy — it uses libinput's own
-> (excellent) finger detection, keeps four-finger gestures fully native,
-> and adds no duplicate device. On KDE Plasma Wayland I switch it on with a
-> tiny LD_PRELOAD shim: **[enable-3fg-drag](https://github.com/joaodriessen/enable-3fg-drag)**.
+> **This fork has served its purpose — here's where to go instead.**
 >
-> This proxy remains the fallback for **libinput < 1.28** or setups where
-> the native feature can't be enabled. It's what I ran daily before the
-> native route worked for me; I've since switched to enable-3fg-drag on my
-> own machine.
+> **1. If you're on libinput ≥ 1.28, you probably don't need any proxy.**
+> libinput now has native three-finger dragging built in; it's just disabled
+> by default and most compositors don't expose a switch. Enabling it is far
+> simpler and more robust — it uses libinput's own (excellent) finger
+> detection, keeps four-finger gestures fully native, and adds no duplicate
+> device. I turn it on with a small dependency-free `LD_PRELOAD` shim that
+> works on any Wayland compositor (KDE, GNOME, …):
+> **[enable-3fg-drag](https://github.com/joaodriessen/enable-3fg-drag)**.
+> That's what runs on my machine today; the proxy no longer does.
+>
+> **2. If you do need the proxy, get it upstream — not here.** The v2
+> evdev-proxy work in this fork was **merged into
+> [lmr97/linux-3-finger-drag](https://github.com/lmr97/linux-3-finger-drag)**
+> (PRs #24–28), so upstream now carries it and is the maintained home. The
+> proxy is still the right answer for **libinput < 1.28**, or setups where
+> the native feature can't be enabled.
+>
+> This fork stays up as the history behind those PRs. The
+> `exclusive-grab-touchpad-proxy` branch additionally holds later
+> experimental work (four-finger gesture scaling, velocity latching, liftoff
+> glide, silent assembly) that was never upstreamed and isn't maintained.
 
 # Three-Finger Drag for Wayland/KDE (and X11)
 
