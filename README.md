@@ -1,3 +1,30 @@
+> [!IMPORTANT]
+> **Superseded — please read before using this branch.**
+>
+> **On libinput ≥ 1.28 you probably don't need any of this.** libinput has
+> native three-finger dragging built in; it's just disabled by default and
+> most compositors don't expose a switch. Turning it on uses libinput's own
+> (excellent) finger detection, keeps four-finger gestures fully native, and
+> adds no duplicate device — far simpler and more robust than this proxy. I
+> enable it with a small dependency-free `LD_PRELOAD` shim that works on any
+> Wayland compositor (KDE, GNOME, …):
+> **[enable-3fg-drag](https://github.com/joaodriessen/enable-3fg-drag)**.
+> That's what runs on my own machine now — this proxy no longer does.
+>
+> **Where the proxy lives now:** the v2 evdev-proxy work was **merged
+> upstream** into
+> [lmr97/linux-3-finger-drag](https://github.com/lmr97/linux-3-finger-drag)
+> (PRs #24–28). If you genuinely need the proxy — libinput < 1.28, or a setup
+> where the native feature can't be enabled — get it from upstream rather
+> than this fork.
+>
+> **What this branch is:** experimental work that came *after* the upstream
+> stack — four-finger gesture scaling, velocity latching, liftoff glide,
+> silent assembly. It is not upstream and is not maintained. Heads-up that
+> the docs below lag the code here: "How it works" still describes a virtual
+> mouse that was replaced by clone-side drags, and the `fourFingerScale`
+> option is not in the config table.
+
 # Three-Finger Drag for Linux (evdev-proxy fork)
 
 Rest three fingers on the touchpad and move them: the window / text / icon
